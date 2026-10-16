@@ -90,6 +90,11 @@ def main():
     elif action == "fix-tests":
         git(cwd, "rm", "-q", "BROKEN")
         git(cwd, "commit", "-qm", "fix the tests")
+    elif action == "new-ticket":
+        commit_file(cwd, "code.txt", "found more work\n", f"implement {name}")
+        Path(ticket.parent, "05-follow-up.md").write_text(
+            "# 05: Follow-up\n\n**Blocked by:** None\n\n**Status:** ready-for-agent\n\n- [ ] more\n",
+            encoding="utf-8")
     elif action == "protected":
         commit_file(cwd, "migrations/001.sql", "drop table users;\n", "touch a migration")
     elif action == "threshold":

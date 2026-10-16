@@ -816,3 +816,31 @@ def test_verify_step_takes_the_review_agent_settings(basic):
     basic.set_plan({"01-first:implement": ["noop"]})
     assert basic.run("--once") == 0
     assert [c["model"] for c in basic.calls_list()] == [None, "reviewer"]
+
+
+# --- tickets the agent creates ------------------------------------------------
+
+
+def test_tickets_created_by_the_agent_wait_for_triage(basic):
+    basic.set_plan({"01-first:implement": ["new-ticket"]})
+    assert basic.run() == rt.EXIT_BLOCKED  # the feature waits for the new ticket's triage
+    assert "05-follow-up:implement" not in basic.keys()
+    assert basic.status("05-follow-up") == "needs-triage"
+    assert all(basic.status(n) == "done" for n in ("01-first", "02-second", "03-third", "04-fourth"))
+    assert "01-first - new tickets: 05-follow-up" in basic.report()
+    assert "Set to needs-triage by the runner: 05-follow-up (ready-for-agent)" in basic.report()
+    prompt = basic.calls_list()[0]["prompt"]
+    assert "give each one the status line `**Status:** needs-triage`" in prompt
+
+
+def test_new_tickets_of_an_interrupted_step_are_triaged_on_restart(basic):
+    runs = basic.feature / "runs"
+    runs.mkdir()
+    head = git(basic.repo, "rev-parse", "HEAD")
+    (runs / "state.json").write_text(json.dumps({"tickets": {"01-first": {
+        "phase": "implement", "running": True, "base": head, "branch": "main", "stash": "",
+        "tickets_before": ["01-first", "02-second", "03-third", "04-fourth"]}}}))
+    basic.add("05-follow-up", ticket("05", "follow-up"))
+    assert basic.run("--once") == 0
+    assert basic.status("05-follow-up") == "needs-triage"
+    assert basic.keys() == ["01-first:implement", "01-first:review"]

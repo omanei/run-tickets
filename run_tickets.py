@@ -69,6 +69,7 @@ EXIT_INTERRUPTED = 130
 # Statuses of the local tracker. "done" is the only one the runner treats as finished.
 RUNNABLE = "ready-for-agent"
 DONE = "done"
+NEW_TICKET_STATUS = "needs-triage"  # tickets an agent creates during a run wait for a human
 CLOSED = {"done", "wontfix"}
 
 STEPS = ("implement", "review", "verify", "final")
@@ -182,6 +183,7 @@ COMMON_PROMPT = """You run unattended: nobody will answer questions. Decide by t
 If you cannot finish, set the ticket's status line to `**Status:** needs-info`, append the reason under a `## Comments` heading at the end of the ticket file, and stop.
 End your final answer with a section headed `## {{report_heading}}`, written in {{report_language}}, for whoever reads the run in the morning: what you did (commit hashes), which checks you ran and their results, what is left or failed, and - if you stopped early or left anything uncommitted - exactly why.
 {{git_rules}}
+{{new_tickets_rule}}
 {{extra_instructions}}"""
 
 GIT_RULES = """Never run git stash, git reset --hard, git clean, git rebase, git commit --amend, git push, git checkout of another branch, or git checkout/restore of files you did not change: the working tree, the branch and the stash list hold the user's own work. To test the code without your changes, use git worktree add in a temporary directory and remove it afterwards.
@@ -229,6 +231,7 @@ Without asking:
 4. If something cannot be fixed here, say what and why in your report.
 End your final answer with a section headed `## {{report_heading}}`, written in {{report_language}}: what you found, what you fixed (commit hashes), which checks you ran and their results, and what is left.
 {{git_rules}}
+{{new_tickets_rule}}
 {{final_review_extra_instructions}}
 {{resume_note}}"""
 
@@ -1461,6 +1464,9 @@ class Runner:
             "review_extra_instructions": self.cfg.get("review_extra_instructions", ""),
             "final_review_extra_instructions": self.cfg.get("final_review_extra_instructions", ""),
             "resume_note": resume_note,
+            "new_tickets_rule": (f"If you create new tickets in {self.feature.issues}, give each one the "
+                                 f"status line `**Status:** {NEW_TICKET_STATUS}`: the runner does not "
+                                 f"pick such tickets up, a human triages them first."),
             "kind_note": ("This is a report ticket (Kind: report): its result is the report and "
                           "the files the ticket names, not code; commit only code you change."
                           if unit.kind() == "report" else ""),
@@ -1738,6 +1744,10 @@ class Runner:
         self.rotate_logs()
         if self.state.data.get("waiting"):
             self.state.set(waiting=None)
+        for name, entry in list(self.state.data["tickets"].items()):
+            if entry.get("tickets_before") is not None:  # a step cut off before its triage
+                unit = FinalUnit(self.feature) if name == FINAL else Ticket(self.feature.issues / f"{name}.md")
+                self.triage_new_tickets(unit, entry)
         recovered = self.recover_finished_step()
         if recovered is not None:
             return recovered
@@ -1880,9 +1890,11 @@ class Runner:
             prompt = self.build_prompt(step, unit, entry["base"], note)
             self.state.update(unit.name, phase=step, running=True, stash=self.git.stash(),
                               branch=self.git.branch(), step_head=self.git.head(),
-                              attempt=attempt + 1)
+                              attempt=attempt + 1,
+                              tickets_before=[t.name for t in self.feature.tickets()])
             run = self.run_agent(unit, step, prompt, attempt + 1)
             self.account(unit, run)
+            self.triage_new_tickets(unit, entry)
             failed = self.check_step(step, unit, entry, run)
             if failed is None:
                 return self.step_passed(unit, step, run, entry)
@@ -1919,6 +1931,30 @@ class Runner:
                 f"in {fmt_duration(self.cfg['retry_delay_seconds'])}")
             time.sleep(self.cfg["retry_delay_seconds"])
             note = self.retry_note(step, reason, run)
+
+    def triage_new_tickets(self, unit: Any, entry: Dict[str, Any]) -> None:
+        """Tickets the agent created during the step wait for a human: the runner sets them
+        to needs-triage whatever status the agent gave them, so they are never picked up."""
+        before = entry.get("tickets_before")
+        if before is None:
+            return
+        new = [t for t in self.feature.tickets() if t.name not in set(before)]
+        entry.pop("tickets_before", None)
+        self.state.save()
+        if not new:
+            return
+        changed = []
+        for t in new:
+            if t.status() != NEW_TICKET_STATUS:
+                changed.append(f"{t.name} ({t.status() or 'no status'})")
+                t.set_status(NEW_TICKET_STATUS)
+        names = ", ".join(t.name for t in new)
+        say(f"==> {unit.name}: new ticket(s) from the agent, left for triage: {names}")
+        self.event("new_tickets", ticket=unit.name, new=[t.name for t in new], changed=changed)
+        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} {unit.name} - new tickets: {names}\n\n"
+                       f"The agent created them; they are {NEW_TICKET_STATUS} and wait for a human."
+                       + (f" Set to {NEW_TICKET_STATUS} by the runner: {', '.join(changed)}." if changed else "")
+                       + "\n\n")
 
     def step_passed(self, unit: Any, step: str, run: StepRun, entry: Dict[str, Any]) -> int:
         if step == "implement":
