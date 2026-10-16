@@ -2410,8 +2410,9 @@ def cmd_adopt(feature: Feature, feature_base: Optional[str], resume: List[str]) 
                 raise UsageError(f"{what}: '{rev}' is not a commit in {git.repo}")
             sha = r.stdout.strip()
             if not git.is_ancestor(sha, branch):
-                warn(f"warning: {what} {sha[:10]} is not in the history of {branch}; "
-                     f"the run starts that ticket over unless it is by then")
+                warn(f"warning: {what} {sha[:10]} is not in the history of {branch}; a run "
+                     f"ignores a base that is not, and starts that ticket (or the final "
+                     f"review's range) from the current HEAD")
             return sha
 
         plans = []
