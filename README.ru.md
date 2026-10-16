@@ -1,5 +1,12 @@
 # run-tickets
 
+[![tests](https://github.com/omanei/run-tickets/actions/workflows/test.yml/badge.svg)](https://github.com/omanei/run-tickets/actions/workflows/test.yml)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![platforms](https://img.shields.io/badge/os-linux%20%7C%20macos%20%7C%20windows-lightgrey)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
+[English](README.md) | **Русский**
+
 Ночной исполнитель тикетов для процесса скиллов [Matt Pocock](https://github.com/mattpocock/skills):
 `/to-spec` → `/to-tickets` → **run-tickets** → готовая ветка в вашем репозитории.
 
@@ -22,6 +29,11 @@
  все тикеты done ─▶ финальное ревью фичи ─▶ тесты ─▶ ветка feat/… в репозитории ─▶ уведомление
 ```
 
+![демо: три тикета, ошибка агента поймана и шаг перезапущен, финальное ревью](docs/demo.gif)
+
+*Настоящий вывод раннера, вместо модели работает демо-агент. На тикете 02 агент сообщает,
+что всё готово, но оставляет критерий неотмеченным. Раннер это видит и перезапускает шаг.*
+
 - Работает на **Linux, macOS и Windows**: нужны Python 3.9+ и git, других зависимостей нет.
 - Агенты: **omp, pi, Claude Code, Codex** и любой другой через конфиг. Каждому шагу можно
   дать своего агента и свою модель.
@@ -43,6 +55,10 @@ run-tickets run .scratch/my-feature
 
 Утром достаточно открыть `.scratch/my-feature/runs/SUMMARY.md` или выполнить
 `run-tickets status .scratch/my-feature`.
+
+**Попробовать без модели:** склонируйте репозиторий и выполните `python examples/demo.py`.
+Демо создаёт временный git-репозиторий с примером фичи (`examples/demo`: спека и три тикета)
+и прогоняет её с демо-агентом. Ваши репозитории не затрагиваются.
 
 ## Установка
 
@@ -365,12 +381,12 @@ model = "opus"
 | `notify_command` | `""` | команда уведомления |
 | `desktop_notify` | `true` | системные уведомления |
 | `extra_instructions` | `""` | правила проекта для implement и review |
-| `review_extra_instructions` | `""` | правила только для review |
+| `review_extra_instructions` | `""` | правила только для review (и verify) |
 | `final_review_extra_instructions` | `""` | правила для финального ревью |
 | `[skills] implement`, `review` | `"implement"`, `"code-review"` | имена скиллов; у плагинов Claude Code с префиксом: `"<плагин>:code-review"` |
 | `[steps.<шаг>]` | — | `agent`, `model`, `max_time` для `implement`, `review`, `verify` (по умолчанию как у `review`) или `final` |
 | `[agents.<имя>]` | пресеты | своя команда агента |
-| `[prompts]` | встроенные | полная замена шаблонов `common`, `implement`, `review`, `final` |
+| `[prompts]` | встроенные | полная замена шаблонов `common`, `implement`, `review`, `verify`, `final` |
 
 ### Агенты
 
@@ -568,7 +584,19 @@ python -m pytest
 - паузу;
 - чистку логов;
 - очередь фич;
+- шаг verify, отчётные тикеты и тикеты, которые заводит агент;
+- `adopt`;
 - возобновление после настоящего `kill -9`;
-- stale lock.
+- stale lock;
+- демо из `examples/`.
 
 CI (`.github/workflows/test.yml`) гоняет тесты на Linux, macOS и Windows с Python 3.9 и 3.13.
+
+GIF в начале README собирается из настоящего прогона демо: `python examples/record_demo.py`
+(нужен Pillow).
+
+История изменений — в [CHANGELOG.md](CHANGELOG.md).
+
+## Лицензия
+
+[MIT](LICENSE).
