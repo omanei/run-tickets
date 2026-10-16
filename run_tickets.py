@@ -17,8 +17,8 @@ over from the previous ticket or step:
 The next ticket starts only after the previous one passed both steps and every check
 the runner makes itself (including the project's tests, when test_command is set).
 The agent's own words about the repository are never trusted. When every ticket is
-done, a final review looks at the whole feature, and the branch can be pushed and a
-pull request opened.
+done, a final review looks at the whole feature. Everything stays local: the work ends
+up as a branch in the repository, and pushing it is up to you.
 
   run-tickets run    .scratch/my-feature     # run until done, blocked or stopped
   run-tickets status .scratch/my-feature     # what is done, what is next, what is stuck
@@ -158,13 +158,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "worktree": False,
     "worktree_dir": "{{repo}}/../{{repo_name}}-worktrees/{{feature}}",
     "worktree_setup": [],
-    "push": "never",
-    "remote": "origin",
-    "pull_request": False,
-    "pr_base": "",
-    "pr_title": "{{feature}}: {{spec_title}}",
-    "pr_command": ["gh", "pr", "create", "--base", "{{base_branch}}", "--head", "{{branch}}",
-                   "--title", "{{title}}", "--body-file", "{{body_file}}"],
     # The end of the feature.
     "final_review": True,
     "pause_after": [],
@@ -611,10 +604,6 @@ class Git:
     def has_branch(self, name: str) -> bool:
         return self.run("rev-parse", "--verify", "-q", f"refs/heads/{name}").returncode == 0
 
-    def default_remote_branch(self, remote: str) -> str:
-        r = self.run("symbolic-ref", "-q", "--short", f"refs/remotes/{remote}/HEAD")
-        return r.stdout.strip().split("/", 1)[-1] if r.returncode == 0 else ""
-
     def stash(self) -> str:
         r = self.run("rev-parse", "-q", "--verify", "refs/stash")
         return r.stdout.strip() if r.returncode == 0 else ""
@@ -778,7 +767,6 @@ class State:
     git           branch, base_branch, worktree of the run
     current       the agent process running right now, for `status`
     waiting       a provider-limit wait in progress
-    pr_url        the pull request, once opened
     """
 
     def __init__(self, path: Path):
@@ -858,8 +846,8 @@ def resolve_agent(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
 
 
 # Command-line flags that override config keys.
-CLI_KEYS = ("agent", "model", "max_time", "retries", "branch", "worktree", "push",
-            "pull_request", "final_review", "test_command")
+CLI_KEYS = ("agent", "model", "max_time", "retries", "branch", "worktree", "final_review",
+            "test_command")
 
 
 def build_config(path: Optional[Path], args: argparse.Namespace) -> Dict[str, Any]:
@@ -907,8 +895,6 @@ def build_config(path: Optional[Path], args: argparse.Namespace) -> Dict[str, An
                              "spec": resolve_agent(cfg, name)}
     cfg["agent_spec"] = cfg["step"]["implement"]["spec"]
 
-    if cfg["push"] not in ("never", "ticket", "end"):
-        raise UsageError("push must be 'never', 'ticket' or 'end'")
     cfg["max_seconds"] = parse_duration(cfg["max_time"])
     cfg["retries"] = max(0, int(cfg["retries"]))
     for key in ("retry_delay", "test_timeout", "limit_default_wait", "limit_max_wait",
@@ -948,20 +934,17 @@ agent = "{{init_agent}}"           # omp | pi | claude | codex, or a name under 
 # limit_default_wait = "30m"   # when the agent's error names no reset time
 # limit_max_wait = "12h"       # per step; past it the run stops
 
-# ---- Git flow.
+# ---- Git: everything stays local. The runner never pushes; the result is a branch in
+# the repository, and pushing it is up to you.
 # branch = ""               # e.g. "feat/{{feature}}"; empty = the current branch
 # worktree = false          # true: work in a separate git worktree on that branch, so
-#                           # your own checkout stays untouched (and usable) all night
+#                           # your own checkout stays untouched (and usable) all night;
+#                           # when every ticket is done the worktree folder is removed and
+#                           # the branch stays in the repository
 # worktree_dir = "{{repo}}/../{{repo_name}}-worktrees/{{feature}}"
 # worktree_setup = []       # shell commands run once in a new worktree, which has only
 #                           # tracked files; $RUN_TICKETS_MAIN_REPO is your checkout, e.g.
 #                           # ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "npm ci"]
-# push = "never"            # never | ticket (after every done ticket) | end
-# remote = "origin"
-# pull_request = false      # open a PR when every ticket and the final review are done
-# pr_base = ""              # default: the branch the feature branch was created from
-# pr_title = "{{feature}}: {{spec_title}}"
-# pr_command = ["gh", "pr", "create", "--base", "{{base_branch}}", "--head", "{{branch}}", "--title", "{{title}}", "--body-file", "{{body_file}}"]
 
 # ---- The end of the feature.
 # final_review = true       # one more review of the whole feature against the spec
@@ -1391,7 +1374,6 @@ class Runner:
         done = sum(1 for t in tickets if t.status() == DONE)
         entries = self.state.data["tickets"]
         total_cost = sum(e.get("cost", 0) for e in entries.values())
-        pr = self.state.data.get("pr_url", "")
         git = self.state.data.get("git", {})
         lines = [f"# {self.feature.name}: run-tickets summary", "",
                  f"- outcome: **{outcome}**" + (f" - {detail}" if detail else ""),
@@ -1400,8 +1382,6 @@ class Runner:
                  f"- cost: {fmt_cost(self.run_cost)} this run, {fmt_cost(total_cost)} in total"]
         if git.get("branch"):
             lines.append(f"- branch: {git['branch']}" + (f" (worktree {git['worktree']})" if git.get("worktree") else ""))
-        if pr:
-            lines.append(f"- pull request: {pr}")
         lines += ["", "| Ticket | Status | Runner | Agent runs | Time | Cost |",
                   "|---|---|---|---|---|---|"]
         for t in tickets:
@@ -1422,8 +1402,6 @@ class Runner:
             short += f"; {outcome}" + (f" - {detail}" if detail else "")
         if self.run_cost:
             short += f"; {fmt_cost(self.run_cost)}"
-        if pr:
-            short += f"; PR {pr}"
         return short
 
     # -- the agent ---------------------------------------------------------
@@ -1779,8 +1757,6 @@ class Runner:
                 self.state.update(name, phase="done", running=False, last_stop=None, finished=iso())
                 self.record(ticket, "review", "ok - ticket done (checked after an interrupted run)",
                             None, entry["base"])
-                if self.cfg["push"] == "ticket":
-                    self.push()
             else:
                 self.state.update(name, phase="review", running=False)
         return None
@@ -1833,8 +1809,6 @@ class Runner:
         self.state.update(ticket.name, commits=commits)
         self.done_this_run.append((ticket.name, time.monotonic() - started, commits))
         say(f"==> {ticket.name} done: {commits} commit(s)")
-        if self.cfg["push"] == "ticket":
-            self.push()
         if self.should_pause(ticket) and not entry.get("paused"):
             self.state.update(ticket.name, paused=True)
             self.event("paused", ticket=ticket.name)
@@ -1959,18 +1933,42 @@ class Runner:
             code = self.run_final()
             if code != EXIT_OK:
                 return code
-        pushed = False
-        if self.cfg["push"] in ("ticket", "end") or self.cfg["pull_request"]:
-            pushed = self.push()
-        if self.cfg["pull_request"]:
-            if pushed:
-                self.open_pr()
-            else:
-                warn("not opening a pull request: the branch is not pushed")
-        self.event("all_done")
-        self.notify(self.write_summary("done", "every ticket is done"))
+        branch = self.git.branch()
+        base_branch = self.state.data.get("git", {}).get("base_branch", "")
+        self.release_worktree()
+        self.event("all_done", branch=branch)
+        self.notify(self.write_summary("done", f"every ticket is done, the work is on branch {branch}"))
         self.print_done()
+        say(f"\nThe work is on branch {branch} in {self.main_git.repo}:")
+        if base_branch:
+            say(f"  git log --oneline {base_branch}..{branch}")
+            say(f"  git diff {base_branch}...{branch}")
+        say(f"  git push -u origin {branch}     # when you want it on the server")
         return EXIT_OK
+
+    def release_worktree(self) -> None:
+        """Every ticket is done: the worktree folder goes, the branch stays in the repo."""
+        info = self.state.data.get("git", {})
+        path = info.get("worktree")
+        if not path:
+            return
+        leftovers = self.git.out("status", "--porcelain")
+        if leftovers:
+            msg = (f"keeping the worktree {path}: it has files that are not committed "
+                   f"(remove it yourself with `git worktree remove --force {path}`):\n{leftovers}")
+            warn(msg)
+            append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} WORKTREE KEPT\n\n> "
+                                        + msg.replace("\n", "\n> ") + "\n\n")
+            return
+        r = self.main_git.run("worktree", "remove", path)
+        if r.returncode != 0:
+            warn(f"could not remove the worktree {path}: {r.stderr.strip()}")
+            return
+        self.main_git.run("worktree", "prune")
+        info["worktree"] = ""
+        self.state.save()
+        self.event("worktree_removed", path=path)
+        say(f"==> removed the worktree {path}; the branch {info.get('branch')} stays in the repository")
 
     def feature_base(self) -> str:
         base = self.state.data.get("feature_base", "")
@@ -2003,90 +2001,6 @@ class Runner:
             return self.stop(unit, "final", pre, None, base)
         return self.run_step(unit, "final")
 
-    def push(self) -> bool:
-        branch = self.git.branch()
-        remote = self.cfg["remote"]
-        if branch == "(detached)":
-            warn("not pushing: HEAD is detached")
-            return False
-        error = ""
-        for i in range(4):
-            r = self.git.run("push", "-u", remote, branch)
-            if r.returncode == 0:
-                self.state.set(pushed=self.git.head())
-                self.event("pushed", branch=branch, remote=remote)
-                say(f"==> pushed {branch} to {remote}")
-                return True
-            error = r.stderr.strip()
-            if i < 3:
-                time.sleep(2 ** (i + 1))
-        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} PUSH FAILED - {branch} to "
-                                    f"{remote}\n\n> {error[-1000:]}\n\n")
-        self.event("push_failed", branch=branch, error=error[-500:])
-        warn(f"push of {branch} to {remote} failed: {error[-300:]}")
-        return False
-
-    def pr_body(self) -> str:
-        entries = self.state.data["tickets"]
-        final = ", then a final review of the whole feature" if self.cfg["final_review"] else ""
-        lines = [f"Implemented with run-tickets, one fresh agent process per step "
-                 f"(implement, review){final}.", "",
-                 "| Ticket | Agent runs | Time | Cost | Commits |", "|---|---|---|---|---|"]
-        for t in self.feature.tickets():
-            e = entries.get(t.name, {})
-            lines.append(f"| {t.name}: {t.title()} | {e.get('runs', 0)} | "
-                         f"{fmt_duration(e.get('seconds', 0))} | {fmt_cost(e.get('cost'))} | "
-                         f"{e.get('commits', '-')} |")
-        fe = entries.get(FINAL)
-        if fe:
-            lines.append(f"| final review | {fe.get('runs', 0)} | {fmt_duration(fe.get('seconds', 0))} | "
-                         f"{fmt_cost(fe.get('cost'))} | |")
-        base = self.feature_base()
-        if base:
-            sus = self.suspicious(base)
-            if sus:
-                lines += ["", "**Check these test changes** (skips, ignores, changed constants):"]
-                lines += [f"- `{f}`: `{l[:160]}`" for f, l in sus[:30]]
-        if self.cfg.get("test_command"):
-            lines += ["", f"Every step passed `{self.cfg['test_command']}`, run by the runner itself."]
-        return "\n".join(lines) + "\n"
-
-    def open_pr(self) -> None:
-        if self.state.data.get("pr_url"):
-            return
-        git_info = self.state.data.get("git", {})
-        base = (self.cfg.get("pr_base") or git_info.get("base_branch")
-                or self.git.default_remote_branch(self.cfg["remote"]))
-        if not base:
-            warn("not opening a pull request: set pr_base, the base branch is unknown")
-            return
-        body = self.feature.runs / "PR.md"
-        atomic_write(body, self.pr_body())
-        title = fill(self.cfg["pr_title"], {"feature": self.feature.name,
-                                            "spec_title": self.feature.spec_title()})
-        values = {"base_branch": base, "branch": self.git.branch(), "title": title,
-                  "body_file": str(body), "remote": self.cfg["remote"]}
-        argv = [fill(a, values) for a in self.cfg["pr_command"]]
-        try:
-            argv = resolve_executable(argv[0]) + argv[1:]
-            r = subprocess.run(argv, cwd=str(self.git.repo), capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=300)
-        except (UsageError, OSError, subprocess.SubprocessError) as e:
-            warn(f"not opening a pull request: {e}")
-            append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} PULL REQUEST FAILED - {e}\n\n")
-            return
-        m = re.search(r"https?://\S+", r.stdout + "\n" + r.stderr)
-        if r.returncode == 0 or m:
-            url = m.group(0) if m else "(opened)"
-            self.state.set(pr_url=url)
-            self.event("pull_request", url=url)
-            append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} PULL REQUEST - {url}\n\n")
-            say(f"==> pull request: {url}")
-        else:
-            err = (r.stderr or r.stdout).strip()[-1000:]
-            warn(f"the pull request command failed: {err}")
-            append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} PULL REQUEST FAILED\n\n> {err}\n\n")
-
     def print_done(self) -> None:
         if not self.done_this_run:
             return
@@ -2100,12 +2014,12 @@ class Runner:
     def rotate_logs(self) -> None:
         """Deletes step logs, transcripts, prompts and sessions older than log_retention,
         then the oldest ones while runs/ is over log_max_mb (never anything from the last
-        day, nor REPORT.md, SUMMARY.md, PR.md, state.json, events.jsonl)."""
+        day, nor REPORT.md, SUMMARY.md, state.json, events.jsonl)."""
         retention = self.cfg["log_retention_seconds"]
         cap = float(self.cfg.get("log_max_mb") or 0) * 1024 * 1024
         if not retention and not cap:
             return
-        keep = {"REPORT.md", "SUMMARY.md", "PR.md", "state.json", "events.jsonl", ".lock"}
+        keep = {"REPORT.md", "SUMMARY.md", "state.json", "events.jsonl", ".lock"}
         items: List[Path] = []
         for p in self.feature.runs.iterdir():
             if p.name in keep or p.name.endswith(".tmp"):
@@ -2242,8 +2156,6 @@ def status_text(feature: Feature) -> List[str]:
     done = sum(1 for t in tickets if t.status() == DONE)
     cost = sum(e.get("cost", 0) for e in data["tickets"].values())
     out.append(f"done: {done}/{len(tickets)}" + (f", cost so far {fmt_cost(cost)}" if cost else ""))
-    if data.get("pr_url"):
-        out.append(f"pull request: {data['pr_url']}")
     for name in ("SUMMARY.md", "REPORT.md"):
         if (feature.runs / name).exists():
             out.append(f"{name.split('.')[0].lower()}: {feature.runs / name}")
@@ -2299,7 +2211,7 @@ def cmd_config(feature: Feature, args: argparse.Namespace) -> int:
     say("")
     shown = ("agent", "model", "max_time", "retries", "retry_delay", "test_command", "test_timeout",
              "test_baseline", "limit_wait", "limit_default_wait", "limit_max_wait", "branch",
-             "worktree", "worktree_dir", "worktree_setup", "push", "remote", "pull_request", "pr_base", "pr_title",
+             "worktree", "worktree_dir", "worktree_setup",
              "final_review", "pause_after", "max_cost", "max_step_cost", "protected",
              "log_retention", "log_max_mb", "report_heading", "report_language",
              "desktop_notify", "notify_command", "preflight", "extra_instructions",
@@ -2435,9 +2347,6 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         sp.add_argument("--branch", help="work on this branch, e.g. feat/{{feature}}")
         sp.add_argument("--worktree", action="store_true", default=None,
                         help="work in a separate git worktree on that branch")
-        sp.add_argument("--push", choices=("never", "ticket", "end"), help="when to push the branch")
-        sp.add_argument("--pr", dest="pull_request", action="store_true", default=None,
-                        help="open a pull request when the feature is done")
         sp.add_argument("--no-final-review", dest="final_review", action="store_false", default=None,
                         help="skip the review of the whole feature at the end")
         sp.add_argument("--pause-after", dest="pause_after", action="append",

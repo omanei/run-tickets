@@ -542,41 +542,45 @@ def test_parse_limit_wait():
 # --- git flow: branch, worktree, push, pull request ------------------------
 
 
-def test_worktree_branch_push_and_pull_request(basic, tmp_path):
+def test_worktree_leaves_only_a_local_branch(basic, tmp_path):
     remote = tmp_path / "remote.git"
     git(tmp_path, "init", "-q", "--bare", str(remote))
     git(basic.repo, "remote", "add", "origin", str(remote))
-    pr = tmp_path / "pr.py"
-    pr.write_text("import json, sys\n"
-                  f"open({json.dumps(str(tmp_path / 'pr.json'))}, 'w').write(json.dumps(sys.argv[1:]))\n"
-                  "print('https://example.com/pulls/7')\n")
-    basic.write_config(worktree=True, branch="feat/{{feature}}", push="ticket", pull_request=True,
-                       final_review=True,
-                       pr_command=[sys.executable, str(pr), "--base", "{{base_branch}}", "--head",
-                                   "{{branch}}", "--title", "{{title}}", "--body-file", "{{body_file}}"])
+    basic.write_config(worktree=True, branch="feat/{{feature}}", final_review=True)
     main_head = git(basic.repo, "rev-parse", "HEAD")
+    work = basic.repo.parent / "repo-worktrees" / "F-1"
+
+    assert basic.run("--once") == 0
+    assert git(work, "rev-parse", "--abbrev-ref", "HEAD") == "feat/F-1"
+    assert {c["cwd"] for c in basic.calls_list()} == {str(work)}
     assert basic.run() == rt.EXIT_OK
 
-    work = basic.repo.parent / "repo-worktrees" / "F-1"
-    assert git(work, "rev-parse", "--abbrev-ref", "HEAD") == "feat/F-1"
-    # The user's checkout is untouched; the work is on the branch in the worktree.
+    # The user's checkout is untouched.
     assert git(basic.repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
     assert git(basic.repo, "rev-parse", "HEAD") == main_head
     assert (basic.repo / "code.txt").read_text() == "start\n"
-    assert "final polish" in (work / "code.txt").read_text()
-    assert {c["cwd"] for c in basic.calls_list()} == {str(work)}
-    assert basic.keys()[-1] == "final:final"
+    # The worktree folder is gone; the branch with all the work stays in the repository.
+    assert not work.exists()
+    assert str(work) not in git(basic.repo, "worktree", "list")
+    log = git(basic.repo, "log", "--format=%s", "main..feat/F-1")
+    assert "implement 01-first" in log and "final review fixes" in log
+    assert "final polish" in git(basic.repo, "show", "feat/F-1:code.txt")
     assert all(basic.status(n) == "done" for n in ("01-first", "02-second", "03-third", "04-fourth"))
-    # Pushed, and the pull request opened against the branch it started from.
-    assert git(tmp_path, "--git-dir", str(remote), "rev-parse", "feat/F-1") == git(work, "rev-parse", "HEAD")
-    args = json.loads((tmp_path / "pr.json").read_text())
-    assert args[args.index("--base") + 1] == "main"
-    assert args[args.index("--head") + 1] == "feat/F-1"
-    body = Path(args[args.index("--body-file") + 1]).read_text()
-    assert "| 01-first: first |" in body
-    data = json.loads((basic.feature / "runs" / "state.json").read_text())
-    assert data["pr_url"] == "https://example.com/pulls/7"
-    assert "https://example.com/pulls/7" in (basic.feature / "runs" / "SUMMARY.md").read_text()
+    # Nothing was pushed.
+    assert git(tmp_path, "--git-dir", str(remote), "for-each-ref") == ""
+    assert "feat/F-1" in (basic.feature / "runs" / "SUMMARY.md").read_text()
+    # A later run on the finished feature changes nothing.
+    calls = len(basic.keys())
+    assert basic.run() == rt.EXIT_OK
+    assert len(basic.keys()) == calls and not work.exists()
+
+
+def test_worktree_with_uncommitted_files_is_kept(basic):
+    basic.write_config(worktree=True, worktree_setup=[PY + ' -c "open(\'notes.txt\', \'w\').write(\'x\')"'])
+    assert basic.run() == rt.EXIT_OK
+    work = basic.repo.parent / "repo-worktrees" / "F-1"
+    assert (work / "notes.txt").exists()
+    assert "WORKTREE KEPT" in basic.report()
 
 
 def test_worktree_setup_runs_once_and_repeats_until_it_passes(basic, tmp_path):
