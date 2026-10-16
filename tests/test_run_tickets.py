@@ -1,0 +1,470 @@
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+import run_tickets as rt  # noqa: E402
+
+STUB = Path(__file__).resolve().parent / "stub_agent.py"
+
+
+def git(cwd, *args):
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def ticket(num, title, blocked="None", status="ready-for-agent", criteria=2):
+    boxes = "\n".join(f"- [ ] criterion {i}" for i in range(1, criteria + 1))
+    return (f"# {num}: {title}\n\n**What to build:** {title}.\n\n**Blocked by:** {blocked}\n\n"
+            f"**Status:** {status}\n\n{boxes}\n")
+
+
+class Env:
+    def __init__(self, tmp: Path, tracked: bool, prompt_via: str):
+        self.repo = tmp / "repo"
+        self.feature = self.repo / "feat" / "F-1"
+        (self.feature / "issues").mkdir(parents=True)
+        git(self.repo, "init", "-q", "-b", "main")
+        git(self.repo, "config", "user.email", "t@example.com")
+        git(self.repo, "config", "user.name", "Test")
+        git(self.repo, "config", "commit.gpgsign", "false")
+        (self.repo / "code.txt").write_text("start\n")
+        (self.repo / "user.txt").write_text("user\n")
+        if not tracked:
+            (self.repo / ".gitignore").write_text("feat/\n")
+        self.calls = tmp / "calls.jsonl"
+        self.plan = tmp / "plan.json"
+        self.pidfile = tmp / "stub.pid"
+        cmd = [sys.executable, str(STUB), "{{model_args}}", "--session-dir", "{{session_dir}}",
+               "--cwd", "{{repo}}"]
+        if prompt_via == "arg":
+            cmd.append("{{prompt}}")
+        self.config = tmp / "runner.toml"
+        self.config.write_text(
+            'agent = "stub"\nretries = 0\nretry_delay = "0"\ndesktop_notify = false\n'
+            "[agents.stub]\n"
+            f"command = [{', '.join(json.dumps(c) for c in cmd)}]\n"
+            f'prompt_via = "{prompt_via}"\n'
+            'skill_format = "/skill:{{skill}} {{args}}"\n'
+            f"export_command = [{json.dumps(sys.executable)}, {json.dumps(str(STUB))}, "
+            "'--export', '{{session_file}}']\n",
+            encoding="utf-8")
+        self.tracked = tracked
+
+    def add(self, name, text):
+        (self.feature / "issues" / f"{name}.md").write_text(text, encoding="utf-8")
+
+    def commit_all(self):
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-qm", "init")
+
+    def set_plan(self, plan, monkeypatch=None):
+        self.plan.write_text(json.dumps(plan))
+
+    def env(self):
+        return {"STUB_CALLS": str(self.calls), "STUB_PLAN": str(self.plan),
+                "STUB_PIDFILE": str(self.pidfile)}
+
+    def run(self, *extra, config=None):
+        return rt.main(["run", str(self.feature), "--config", str(config or self.config), *extra])
+
+    def calls_list(self):
+        if not self.calls.exists():
+            return []
+        return [json.loads(line) for line in self.calls.read_text().splitlines()]
+
+    def keys(self):
+        return [c["key"] for c in self.calls_list()]
+
+    def status(self, name):
+        return rt.Ticket(self.feature / "issues" / f"{name}.md").status()
+
+    def state(self):
+        return json.loads((self.feature / "runs" / "state.json").read_text())["tickets"]
+
+    def report(self):
+        return (self.feature / "runs" / "REPORT.md").read_text(encoding="utf-8")
+
+
+@pytest.fixture(params=[(False, "arg"), (True, "stdin")], ids=["ignored-arg", "tracked-stdin"])
+def env(request, tmp_path, monkeypatch):
+    e = Env(tmp_path, *request.param)
+    e.set_plan({})
+    for k, v in e.env().items():
+        monkeypatch.setenv(k, v)
+    return e
+
+
+@pytest.fixture
+def basic(env):
+    # Numbers out of blocker order on purpose: 01 -> 03 -> 02 -> 04.
+    env.add("01-first", ticket("01", "first"))
+    env.add("02-second", ticket("02", "second", blocked="03"))
+    env.add("03-third", ticket("03", "third", blocked="#01"))
+    env.add("04-fourth", ticket("04", "fourth", blocked="02, 03 (see PROJ-1234)"))
+    env.commit_all()
+    return env
+
+
+# --- parsing -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("line,status", [
+    ("**Status:** ready-for-agent", "ready-for-agent"),
+    ("**Status**: done", "done"),
+    ("Status: needs-info", "needs-info"),
+    ("- **Status:** Done", "done"),
+    ("Status of the export is unknown", ""),
+])
+def test_status_line(tmp_path, line, status):
+    p = tmp_path / "01-x.md"
+    p.write_text(f"# 01\n\n{line}\n")
+    assert rt.Ticket(p).status() == status
+
+
+@pytest.mark.parametrize("line,blockers", [
+    ("**Blocked by:** None", []),
+    ("**Blocked by:** 04", [4]),
+    ("Blocked by: #2, 03-add-api", [2, 3]),
+    ("**Blocked by**: 05 (needs PROJ-1234)", [5]),
+])
+def test_blocked_by(tmp_path, line, blockers):
+    p = tmp_path / "07-x.md"
+    p.write_text(f"# 07\n\n{line}\n")
+    assert rt.Ticket(p).blockers() == blockers
+
+
+def test_blocked_by_heading(tmp_path):
+    p = tmp_path / "07-x.md"
+    p.write_text("# 07\n\n## Blocked by\n\n- Blocked by #3\n- Blocked by #05\n\n## Notes\n\nsee 09\n")
+    assert rt.Ticket(p).blockers() == [3, 5]
+    p.write_text("# 07\n\n## Blocked by\n\nNone - can start immediately\n")
+    assert rt.Ticket(p).blockers() == []
+
+
+def test_blocked_by_titles(tmp_path):
+    feature = tmp_path / "f"
+    (feature / "issues").mkdir(parents=True)
+    (feature / "issues" / "01-create.md").write_text(ticket("01", "User signs up"))
+    (feature / "issues" / "02-delete.md").write_text(
+        ticket("02", "User signs in", blocked="User signs up"))
+    (feature / "issues" / "03-other.md").write_text(
+        ticket("03", "Other", blocked="None (can start immediately)"))
+    (feature / "issues" / "04-odd.md").write_text(ticket("04", "Odd", blocked="the login work"))
+    f = rt.Feature(feature)
+    t = {x.name: x for x in f.tickets()}
+    assert f.blockers_of(t["02-delete"]) == ([1], "")
+    assert f.blockers_of(t["03-other"]) == ([], "")
+    assert f.blockers_of(t["04-odd"]) == ([], "the login work")
+    assert f.waiting_on(t["04-odd"], f.by_number()) == ["unrecognised 'Blocked by: the login work'"]
+    # 02 waits for 01 even when 01 is stuck and skipped.
+    p = feature / "issues" / "01-create.md"
+    p.write_text(p.read_text().replace("ready-for-agent", "needs-info"))
+    assert f.next_ticket().name == "03-other"
+
+
+def test_duration():
+    assert rt.parse_duration("3h") == 10800
+    assert rt.parse_duration("1h30m") == 5400
+    assert rt.parse_duration("90") == 90
+    with pytest.raises(rt.UsageError):
+        rt.parse_duration("3 hours")
+
+
+# --- full run ------------------------------------------------------------
+
+
+def test_full_run_in_blocker_order(basic):
+    assert basic.run() == rt.EXIT_OK
+    assert basic.keys() == [
+        "01-first:implement", "01-first:review", "03-third:implement", "03-third:review",
+        "02-second:implement", "02-second:review", "04-fourth:implement", "04-fourth:review"]
+    for name in ("01-first", "02-second", "03-third", "04-fourth"):
+        assert basic.status(name) == "done"
+        assert basic.state()[name]["phase"] == "done"
+    report = basic.report()
+    assert report.count(": ok - ticket done") == 4
+    assert "> - step: review 04-fourth (ok)" in report
+    assert list((basic.feature / "runs").glob("01-first-implement-*.html"))
+    review = basic.calls_list()[1]["prompt"]
+    base = basic.state()["01-first"]["base"]
+    assert review.startswith(f"/skill:code-review since {base} for the ticket ")
+    assert not (Path(git(basic.repo, "rev-parse", "--absolute-git-dir")) / "run-tickets.lock").exists()
+
+
+def test_once_and_status(basic, capsys):
+    assert basic.run("--once") == rt.EXIT_OK
+    assert basic.keys() == ["01-first:implement", "01-first:review"]
+    capsys.readouterr()
+    assert rt.main(["status", str(basic.feature)]) == 0
+    out = capsys.readouterr().out
+    assert "[x] 01-first - done" in out
+    assert "next: 03-third" in out
+    assert "02-second - ready-for-agent, 0/2 criteria, waiting on 03-third (ready-for-agent)" in out
+
+
+def test_model_is_passed(basic):
+    assert basic.run("--once", "--model", "big-one") == 0
+    assert basic.calls_list()[0]["model"] == "big-one"
+
+
+# --- stops ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key,action,reason", [
+    ("01-first:implement", "noop", "no commit was made"),
+    ("01-first:implement", "dirty", "uncommitted changes were left"),
+    ("01-first:implement", "exit1", "the agent exited with 1"),
+    ("01-first:review", "unticked", "2 acceptance criteria are not ticked"),
+    ("01-first:review", "noop", "the ticket status is 'ready-for-agent', not done"),
+])
+def test_failed_check_stops(basic, key, action, reason):
+    basic.set_plan({key: [action]})
+    assert basic.run() == rt.EXIT_STOPPED
+    assert f"STOPPED - {reason}" in basic.report()
+    assert basic.state()["01-first"]["last_stop"]["reason"] == reason
+    assert "03-third:implement" not in basic.keys()
+
+
+def test_retry_then_success(basic):
+    basic.set_plan({"01-first:implement": ["noop", "ok"]})
+    assert basic.run("--once", "--retries", "1") == 0
+    assert basic.keys() == ["01-first:implement", "01-first:implement", "01-first:review"]
+    second = basic.calls_list()[1]["prompt"]
+    assert "failed the runner's check: no commit was made" in second
+    assert "FAILED, retrying (1/1) - no commit was made" in basic.report()
+
+
+def test_stash_change_is_never_retried(basic):
+    (basic.repo / "user.txt").write_text("user's own work\n")
+    git(basic.repo, "stash", "push", "-m", "user work")
+    basic.set_plan({"01-first:implement": ["stash-pop"]})
+    assert basic.run("--retries", "3") == rt.EXIT_STOPPED
+    assert basic.keys() == ["01-first:implement"]
+    assert "the git stash list changed" in basic.report()
+
+
+def test_needs_info_stops_and_dependents_wait(basic):
+    basic.set_plan({"01-first:implement": ["needs-info"]})
+    assert basic.run("--retries", "2") == rt.EXIT_STOPPED
+    assert basic.keys() == ["01-first:implement"]
+    assert "the ticket status is now 'needs-info'" in basic.report()
+    # Nothing else is runnable: everything depends on 01.
+    assert basic.run() == rt.EXIT_BLOCKED
+
+
+def test_timeout_kills_the_agent(basic):
+    basic.set_plan({"01-first:implement": ["hang"]})
+    started = time.monotonic()
+    assert basic.run("--max-time", "3s") == rt.EXIT_STOPPED
+    assert time.monotonic() - started < 60
+    assert "ran out of max_time (3s)" in basic.report()
+    pid = int(basic.pidfile.read_text())
+    time.sleep(1)
+    assert not rt.pid_alive(pid)
+
+
+# --- resume --------------------------------------------------------------
+
+
+def test_resume_at_review_after_stop(basic):
+    basic.set_plan({"01-first:review": ["unticked", "ok"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    base = basic.state()["01-first"]["base"]
+    # The agent set done but left boxes; a human re-opens the ticket.
+    p = basic.feature / "issues" / "01-first.md"
+    p.write_text(p.read_text().replace("**Status:** done", "**Status:** ready-for-agent"))
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:implement", "01-first:review", "01-first:review"]
+    resumed = basic.calls_list()[2]["prompt"]
+    assert f"since {base} " in resumed
+    assert "stopped by the runner: 2 acceptance criteria are not ticked" in resumed
+
+
+def test_resume_implement_keeps_base(basic):
+    basic.set_plan({"01-first:implement": ["exit1", "ok"]})
+    base = git(basic.repo, "rev-parse", "HEAD")
+    assert basic.run() == rt.EXIT_STOPPED
+    assert basic.run("--once") == 0
+    assert basic.state()["01-first"]["base"] == base
+
+
+def test_rewritten_history_starts_over(basic):
+    basic.set_plan({"01-first:review": ["noop", "ok"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    old_base = basic.state()["01-first"]["base"]
+    git(basic.repo, "reset", "-q", "--hard", old_base)
+    git(basic.repo, "commit", "-q", "--amend", "--allow-empty", "-m", "rewritten")
+    assert not rt.Git(basic.repo).is_ancestor(old_base)
+    assert basic.run("--once") == 0
+    assert basic.keys()[-2:] == ["01-first:implement", "01-first:review"]
+
+
+def test_dirty_tree_refuses_to_start(basic):
+    (basic.repo / "user.txt").write_text("edited\n")
+    assert basic.run() == rt.EXIT_USAGE
+    assert basic.keys() == []
+
+
+def test_adopt_dirty_after_stop(basic):
+    basic.set_plan({"01-first:implement": ["dirty", "ok"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    assert basic.run("--once") == rt.EXIT_USAGE
+    assert basic.run("--once", "--adopt-dirty") == 0
+    assert "uncommitted changes in the working tree are its unfinished edits" in basic.calls_list()[1]["prompt"]
+
+
+def test_recovers_step_finished_while_runner_was_dead(basic):
+    assert basic.run("--once") == 0
+    # Simulate: the runner died after the agent finished 03's review but before checking it.
+    runner_state = basic.feature / "runs" / "state.json"
+    data = json.loads(runner_state.read_text())
+    head = git(basic.repo, "rev-parse", "HEAD")
+    (basic.repo / "code.txt").write_text("03 work\n")
+    git(basic.repo, "commit", "-qam", "03 work")
+    p = basic.feature / "issues" / "03-third.md"
+    p.write_text(p.read_text().replace("- [ ]", "- [x]").replace("ready-for-agent", "done"))
+    data["tickets"]["03-third"] = {"phase": "review", "running": True, "base": head,
+                                    "branch": "main", "stash": ""}
+    runner_state.write_text(json.dumps(data))
+    assert basic.run("--once") == 0
+    assert "03-third:review" not in basic.keys()
+    assert basic.state()["03-third"]["phase"] == "done"
+    assert "checked after an interrupted run" in basic.report()
+    assert basic.keys()[-2:] == ["02-second:implement", "02-second:review"]
+
+
+# --- lock ----------------------------------------------------------------
+
+
+def lock_path(env):
+    return Path(git(env.repo, "rev-parse", "--absolute-git-dir")) / "run-tickets.lock"
+
+
+def test_live_lock_blocks(basic):
+    lock_path(basic).write_text(json.dumps({"pid": os.getpid(), "host": socket.gethostname()}))
+    assert basic.run() == rt.EXIT_USAGE
+    assert basic.keys() == []
+
+
+def test_stale_lock_is_taken_over(basic):
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    lock_path(basic).write_text(json.dumps({"pid": p.pid, "host": socket.gethostname()}))
+    assert basic.run("--once") == 0
+
+
+# --- a real crash: the runner process is killed mid-step ------------------
+
+
+def test_killed_runner_resumes(basic):
+    basic.set_plan({"01-first:implement": ["commit-then-hang", "ok"]})
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "run_tickets.py"), "run", str(basic.feature),
+         "--config", str(basic.config)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=dict(os.environ))
+    deadline = time.monotonic() + 60
+    while not basic.pidfile.exists():
+        assert time.monotonic() < deadline, "the stub never started"
+        time.sleep(0.2)
+    proc.kill()  # SIGKILL / TerminateProcess: no cleanup at all
+    proc.wait()
+    stub_pid = int(basic.pidfile.read_text())
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(stub_pid), "/T", "/F"], capture_output=True)
+    else:
+        os.kill(stub_pid, signal.SIGKILL)
+    time.sleep(0.5)
+
+    assert lock_path(basic).exists()
+    entry = basic.state()["01-first"]
+    assert entry["running"] is True and entry["phase"] == "implement"
+
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:implement", "01-first:implement", "01-first:review"]
+    resumed = basic.calls_list()[1]["prompt"]
+    assert "was interrupted before it finished" in resumed
+    assert "may hold its partial work" in resumed
+    assert basic.state()["01-first"]["base"] == entry["base"]
+
+
+# --- agents --------------------------------------------------------------
+
+
+def test_claude_stream_output(basic, monkeypatch, capsys):
+    monkeypatch.setenv("STUB_STREAM", "1")
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', 'output = "claude-stream-json"\nskill_format'))
+    assert basic.run("--once") == 0
+    out = capsys.readouterr().out
+    assert "  · Bash: git commit" in out
+    assert "> - step: review 01-first (ok)" in basic.report()
+    assert '"type": "result"' not in basic.report()
+
+
+def _argv(tmp_path, monkeypatch, agent, model=""):
+    monkeypatch.setattr(rt.shutil, "which", lambda name: f"/bin/{name}")
+    repo = tmp_path / "r"
+    (repo / "f" / "issues").mkdir(parents=True)
+    git(repo, "init", "-q")
+    args = rt.parse_args(["run", str(repo / "f"), "--agent", agent] + (["--model", model] if model else []))
+    cfg = rt.build_config(None, args)
+    runner = rt.Runner(rt.Feature(repo / "f"), rt.Git(repo), cfg, args)
+    return runner.agent_argv("PROMPT", Path("/s"), Path("/s/final.md")), str(runner.git.repo)
+
+
+def test_omp_argv(tmp_path, monkeypatch):
+    argv, repo = _argv(tmp_path, monkeypatch, "omp", "opus")
+    assert argv == ["/bin/omp", "--model", "opus", "-p", "--auto-approve", "--session-dir",
+                    str(Path("/s")), "--cwd", repo, "PROMPT"]
+
+
+def test_claude_argv_reads_prompt_from_stdin(tmp_path, monkeypatch):
+    argv, _ = _argv(tmp_path, monkeypatch, "claude")
+    assert "PROMPT" not in argv
+    assert argv[:2] == ["/bin/claude", "-p"]
+
+
+def test_unknown_agent(tmp_path):
+    args = rt.parse_args(["run", str(tmp_path), "--agent", "nope"])
+    with pytest.raises(rt.UsageError):
+        rt.build_config(None, args)
+
+
+def test_init_writes_a_valid_config(tmp_path):
+    assert rt.main(["init", str(tmp_path), "--agent", "claude"]) == 0
+    path = tmp_path / ".ticket-runner.toml"
+    assert rt.load_toml(path) == {"agent": "claude"}
+    # The commented top-level defaults are valid TOML and match the real defaults.
+    top = path.read_text(encoding="utf-8").split("# [skills]")[0]
+    names = ("model", "max_time", "retries", "retry_delay", "desktop_notify",
+             "report_heading", "report_language", "notify_command")
+    keys = [l[2:] for l in top.splitlines() if l.startswith(tuple(f"# {n} = " for n in names))]
+    uncommented = tmp_path / "uncommented.toml"
+    uncommented.write_text("\n".join(keys), encoding="utf-8")
+    values = rt.load_toml(uncommented)
+    for key in names[:-1]:
+        assert values[key] == rt.DEFAULT_CONFIG[key], key
+    assert "$RUN_TICKETS_MESSAGE" in values["notify_command"]
+    assert rt.main(["init", str(tmp_path)]) == rt.EXIT_USAGE
+
+
+def test_config_command_shows_sources_and_command(basic, capsys):
+    assert rt.main(["config", str(basic.feature), "--config", str(basic.config),
+                    "--model", "m1", "--prompts"]) == 0
+    out = capsys.readouterr().out
+    assert '"stub"' in out and "# config file" in out
+    assert '"m1"' in out and "# command line" in out
+    assert "--model m1" in out
+    assert "----- implement prompt for 01-first -----" in out
+    assert "/skill:implement " in out
