@@ -94,6 +94,7 @@ run-tickets config <feature> [--prompts]    # итоговые настройк�
 run-tickets retry  <feature> 05             # повторить шаг, на котором встал тикет 05
 run-tickets reset  <feature> 05             # сделать 05 заново с нуля
 run-tickets skip   <feature> 05 --reason …  # пометить 05 как wontfix с комментарием
+run-tickets adopt  <feature> --feature-base <sha> [--resume 16:review:<sha>]  # перенять фичу
 run-tickets init   [--agent claude]         # создать .ticket-runner.toml в корне репозитория
 ```
 
@@ -492,6 +493,22 @@ Implement без коммитов не провал: его результат �
 
 **Как сделать тикет заново?** `run-tickets reset <feature> 05`: состояние стирается, галочки
 снимаются, тикет начнётся с implement.
+
+**Как перенять фичу, начатую другим раннером или вручную?** Используйте `run-tickets adopt`,
+править `state.json` руками не нужно:
+
+```bash
+run-tickets adopt .scratch/my-feature --feature-base <sha> --resume 16:review:<sha>
+```
+
+- `--feature-base <sha>` — коммит перед первым тикетом фичи. От него финальное ревью смотрит
+  всю фичу.
+- `--resume NN:ФАЗА:<sha>` — продолжить тикет NN с фазы `implement`, `review` или `verify`.
+  `<sha>` — его база, то есть коммит перед его implement. Флаг можно повторять. Тикет
+  получает статус `ready-for-agent`. Если после базы нет коммитов, вместо `review`
+  запустится `verify`.
+
+Готовые (`done`) тикеты перенимать не нужно: раннер видит их статус в файле.
 
 **Как пропустить тикет?** `run-tickets skip <feature> 05 --reason "…"`. Тикет станет
 `wontfix`, а причина запишется в его `## Comments`. Тикеты, которые от него зависят, будут

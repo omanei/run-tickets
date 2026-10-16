@@ -1825,12 +1825,14 @@ class Runner:
             fb = self.state.data.get("feature_base")
             if not fb or not self.git.is_ancestor(fb):
                 self.state.set(feature_base=head)
-        elif entry.get("branch") != self.git.branch():
+        elif entry.get("branch") and entry["branch"] != self.git.branch():
             return self.stop(ticket, entry["phase"],
                              f"the ticket was started on branch {entry.get('branch')}, "
                              f"now on {self.git.branch()}; switch back or run "
                              f"`run-tickets reset {self.feature.dir} {ticket.number:02d}`")
         else:
+            if not entry.get("branch"):  # adopted: it runs on whatever branch the run uses
+                self.state.update(ticket.name, branch=self.git.branch())
             say(f"==> {ticket.name}: resuming at {entry['phase']} (base {entry['base'][:10]})")
 
         pre = self.preflight(ticket.name)
@@ -2388,6 +2390,61 @@ def cmd_ticket(feature: Feature, action: str, ref: str, reason: str) -> int:
         lock.release()
 
 
+def cmd_adopt(feature: Feature, feature_base: Optional[str], resume: List[str]) -> int:
+    """Takes over a feature another runner (or a person) started: the final review's base,
+    and tickets to continue at a given step from a given base commit."""
+    if not feature_base and not resume:
+        raise UsageError("adopt needs --feature-base and/or --resume NN:PHASE:COMMIT")
+    git = Git(feature.dir)
+    lock = Lock(feature.runs / ".lock", feature.dir)
+    lock.acquire()
+    try:
+        state = State(feature.runs / "state.json")
+        branch = (state.data.get("git") or {}).get("branch") or "HEAD"
+
+        def commit(rev: str, what: str) -> str:
+            r = git.run("rev-parse", "--verify", "-q", f"{rev}^{{commit}}")
+            if r.returncode != 0:
+                raise UsageError(f"{what}: '{rev}' is not a commit in {git.repo}")
+            sha = r.stdout.strip()
+            if not git.is_ancestor(sha, branch):
+                warn(f"warning: {what} {sha[:10]} is not in the history of {branch}; "
+                     f"the run starts that ticket over unless it is by then")
+            return sha
+
+        plans = []
+        for item in resume:
+            parts = item.split(":")
+            if len(parts) != 3 or parts[1] not in TICKET_PHASES:
+                raise UsageError(f"--resume '{item}': use NN:PHASE:COMMIT, PHASE one of "
+                                 f"{', '.join(TICKET_PHASES)}")
+            ticket = feature.find(parts[0])
+            if ticket.status() == DONE:
+                raise UsageError(f"{ticket.name} is done; `run-tickets reset` it first to do it again")
+            plans.append((ticket, parts[1], commit(parts[2], f"--resume {ticket.name}")))
+        base = commit(feature_base, "--feature-base") if feature_base else ""
+
+        if base:
+            state.data["feature_base"] = base
+            say(f"feature base: {base[:10]} (the final review looks at everything since it)")
+        for ticket, phase, sha in plans:
+            state.data["tickets"][ticket.name] = {
+                "phase": phase, "base": sha, "running": False, "started": iso(),
+                "adopted": iso(), "updated": iso()}
+            if ticket.status() != RUNNABLE:
+                say(f"{ticket.name}: status {ticket.status() or 'missing'} -> {RUNNABLE}")
+                ticket.set_status(RUNNABLE)
+            say(f"{ticket.name}: the next run continues it at {phase} with base {sha[:10]}"
+                + (" (no commits since: verify instead of review)"
+                   if phase == "review" and git.is_ancestor(sha, branch)
+                   and git.out("rev-parse", branch) == sha else ""))
+        state.save()
+        say(f"run: run-tickets run {feature.dir}")
+        return EXIT_OK
+    finally:
+        lock.release()
+
+
 HELP_EPILOG = """examples:
   run-tickets init --agent claude            # .ticket-runner.toml in the repo root
   run-tickets config .scratch/my-feature      # what will run, with which settings
@@ -2398,6 +2455,7 @@ HELP_EPILOG = """examples:
   run-tickets retry  .scratch/my-feature 05   # rerun the step 05 stopped at
   run-tickets reset  .scratch/my-feature 05   # do 05 again from scratch
   run-tickets skip   .scratch/my-feature 05 --reason "covered by 06"
+  run-tickets adopt  .scratch/my-feature --feature-base abc123 --resume 16:review:def456
 
 The feature dir can be given from anywhere; the runner works in the git repo that
 contains it. Config: --config, else .ticket-runner.toml in the feature dir, else in
@@ -2406,7 +2464,7 @@ exit codes: 0 all done, 1 stopped, 2 usage/setup error, 3 open tickets left,
 4 paused, 130 interrupted
 """
 
-COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip")
+COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip", "adopt")
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -2463,6 +2521,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         t.add_argument("feature")
         t.add_argument("ticket", help="number (05), name (05-slug), or 'final' for the final review")
         t.add_argument("--reason", default="", help="why (written to the ticket's Comments)")
+
+    a = sub.add_parser("adopt", help="take over a feature another runner started")
+    a.add_argument("feature")
+    a.add_argument("--feature-base", dest="feature_base", metavar="COMMIT",
+                   help="the commit before the feature's first ticket (the final review's base)")
+    a.add_argument("--resume", action="append", default=[], metavar="NN:PHASE:COMMIT",
+                   help="continue ticket NN at PHASE (implement, review, verify) with base "
+                        "COMMIT, the commit before its implement step (repeatable)")
 
     i = sub.add_parser("init", help="write an example .ticket-runner.toml")
     i.add_argument("dir", nargs="?", help="where to write it (default: the repo root)")
@@ -2547,6 +2613,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_status(Feature(Path(args.feature)), args.watch)
         if args.command == "config":
             return cmd_config(Feature(Path(args.feature)), args)
+        if args.command == "adopt":
+            return cmd_adopt(Feature(Path(args.feature)), args.feature_base, args.resume)
         if args.command in ("retry", "reset", "skip"):
             return cmd_ticket(Feature(Path(args.feature)), args.command, args.ticket, args.reason)
         if args.dry_run:

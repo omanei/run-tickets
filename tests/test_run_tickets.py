@@ -844,3 +844,61 @@ def test_new_tickets_of_an_interrupted_step_are_triaged_on_restart(basic):
     assert basic.run("--once") == 0
     assert basic.status("05-follow-up") == "needs-triage"
     assert basic.keys() == ["01-first:implement", "01-first:review"]
+
+
+# --- adopt: taking over a feature another runner started ----------------------
+
+
+def adopt(env, *args):
+    return rt.main(["adopt", str(env.feature), *args])
+
+
+def test_adopt_resumes_a_ticket_at_review_with_its_base(basic):
+    base = git(basic.repo, "rev-parse", "HEAD")
+    (basic.repo / "code.txt").write_text("done by another runner\n")
+    git(basic.repo, "commit", "-qam", "implement 01 elsewhere")
+    assert adopt(basic, "--feature-base", base[:8], "--resume", f"01:review:{base[:8]}") == 0
+    data = json.loads((basic.feature / "runs" / "state.json").read_text())
+    assert data["feature_base"] == base
+    assert data["tickets"]["01-first"]["phase"] == "review"
+    assert data["tickets"]["01-first"]["base"] == base
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:review"]
+    assert f"since {base} for the ticket" in basic.calls_list()[0]["prompt"]
+
+
+def test_adopted_review_without_commits_becomes_verify(basic):
+    p = basic.feature / "issues" / "01-first.md"
+    p.write_text(p.read_text().replace("ready-for-agent", "needs-info"))
+    head = git(basic.repo, "rev-parse", "HEAD")
+    assert adopt(basic, "--resume", f"1:review:{head}") == 0
+    assert basic.status("01-first") == "ready-for-agent"
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:verify"]
+
+
+def test_adopted_feature_base_is_the_final_reviews_base(basic):
+    feature_base = git(basic.repo, "rev-parse", "HEAD")
+    (basic.repo / "code.txt").write_text("earlier tickets\n")
+    git(basic.repo, "commit", "-qam", "earlier work of another runner")
+    assert adopt(basic, "--feature-base", feature_base) == 0
+    basic.write_config(final_review=True)
+    assert basic.run() == 0
+    assert f"since {feature_base} for the whole feature" in basic.calls_list()[-1]["prompt"]
+
+
+@pytest.mark.parametrize("args", [
+    [],
+    ["--feature-base", "no-such-commit"],
+    ["--resume", "01:review"],
+    ["--resume", "01:deploy:HEAD"],
+    ["--resume", "99:review:HEAD"],
+])
+def test_adopt_rejects_bad_input(basic, args):
+    assert adopt(basic, *args) == rt.EXIT_USAGE
+    assert not (basic.feature / "runs" / "state.json").exists()
+
+
+def test_adopt_refuses_a_done_ticket(basic):
+    assert basic.run("--once") == 0
+    assert adopt(basic, "--resume", "01:review:HEAD") == rt.EXIT_USAGE
