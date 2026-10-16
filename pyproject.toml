@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "run-tickets"
-version = "0.1.0"
+version = "0.2.0"
 description = "Runs a feature's tickets one by one with a coding agent (omp, pi, Claude Code, Codex): implement, review, verify, resume after a crash."
 readme = "README.md"
 requires-python = ">=3.9"
