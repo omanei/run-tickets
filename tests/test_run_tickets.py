@@ -902,3 +902,15 @@ def test_adopt_rejects_bad_input(basic, args):
 def test_adopt_refuses_a_done_ticket(basic):
     assert basic.run("--once") == 0
     assert adopt(basic, "--resume", "01:review:HEAD") == rt.EXIT_USAGE
+
+
+# --- the demo in examples/ -----------------------------------------------------
+
+
+def test_the_demo_runs_and_catches_the_agents_slip():
+    r = subprocess.run([sys.executable, str(ROOT / "examples" / "demo.py")], capture_output=True,
+                       text=True, encoding="utf-8", env=dict(os.environ, DEMO_DELAY="0"))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "review failed (1 acceptance criterion is not ticked); retrying" in r.stdout
+    assert "export-csv: 3/3 done" in r.stdout
+    assert "final review: done" in r.stdout

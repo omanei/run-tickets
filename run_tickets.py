@@ -55,7 +55,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 IS_WINDOWS = os.name == "nt"
 
@@ -1690,7 +1690,8 @@ class Runner:
                 return f"the ticket status is '{status or 'missing'}', not done", status == RUNNABLE
             left = unit.unchecked()
             if left:
-                return f"{left} acceptance criteria are not ticked", True
+                return (f"{left} acceptance criteri{'on is' if left == 1 else 'a are'} "
+                        f"not ticked"), True
         if self.git.tracked_changes(self.exclude):
             return "uncommitted changes were left", True
         tests = self.run_tests(f"{unit.name}-{step}")
@@ -1931,8 +1932,9 @@ class Runner:
             self.state.update(unit.name, running=False)
             self.record(unit, step, f"FAILED, retrying ({attempt}/{attempts - 1}) - {reason}", run,
                         entry["base"])
-            say(f"==> {unit.name}: {step} failed ({reason}); retrying with a fresh process "
-                f"in {fmt_duration(self.cfg['retry_delay_seconds'])}")
+            delay = self.cfg["retry_delay_seconds"]
+            say(f"==> {unit.name}: {step} failed ({reason}); retrying with a fresh process"
+                + (f" in {fmt_duration(delay)}" if delay else ""))
             time.sleep(self.cfg["retry_delay_seconds"])
             note = self.retry_note(step, reason, run)
 

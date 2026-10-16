@@ -1,415 +1,450 @@
 # run-tickets
 
-Ночной исполнитель тикетов для процесса скиллов [Matt Pocock](https://github.com/mattpocock/skills):
-`/to-spec` → `/to-tickets` → **run-tickets** → готовая ветка в вашем репозитории.
+[![tests](https://github.com/omanei/run-tickets/actions/workflows/test.yml/badge.svg)](https://github.com/omanei/run-tickets/actions/workflows/test.yml)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![platforms](https://img.shields.io/badge/os-linux%20%7C%20macos%20%7C%20windows-lightgrey)
+[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Раннер берёт тикеты фичи по одному в порядке блокеров. На каждый тикет он запускает агента
-два раза, каждый раз с чистым контекстом:
-- `implement`;
-- `code-review` с исправлением находок, отметкой галочек и `Status: done`. Если implement не
-  сделал коммитов (отчёт, прогон стенда, заведение тикетов), ревьюить нечего, и вместо
-  ревью идёт шаг `verify`: проверка результата по критериям тикета.
+**English** | [Русский](README.ru.md)
 
-После каждого шага раннер сам проверяет репозиторий и прогоняет тесты проекта. Когда все
-тикеты готовы, проводится финальное ревью всей фичи. Всё происходит локально: в итоге в
-репозитории появляется ветка с коммитами, а пушить её или нет, решаете вы. Если раннер упал,
-его можно запустить снова, и он продолжит с того же шага.
+Run a feature's tickets overnight with a coding agent: one ticket at a time, a fresh agent
+for every step, and every step checked by the runner rather than taken on the agent's word.
 
-```
- следующий тикет ─▶ implement ─▶ проверки + тесты ─▶ review ─▶ проверки + тесты ─▶ done
-        ▲              │ провал: повтор │ лимит провайдера: ждать           │
-        └──────────────┴────────────────┴──── state.json хранит шаг и базу ─┘
- все тикеты done ─▶ финальное ревью фичи ─▶ тесты ─▶ ветка feat/… в репозитории ─▶ уведомление
-```
+It picks up where [Matt Pocock's skills](https://github.com/mattpocock/skills) leave off:
+`/to-spec` → `/to-tickets` → **run-tickets** → a finished branch in your repository.
 
-- Работает на **Linux, macOS и Windows**: нужны Python 3.9+ и git, других зависимостей нет.
-- Агенты: **omp, pi, Claude Code, Codex** и любой другой через конфиг. Каждому шагу можно
-  дать своего агента и свою модель.
+![demo: three tickets, an agent's slip caught and the step retried, a final review](docs/demo.gif)
 
-## Быстрый старт
+*The runner's real output, with a stand-in agent instead of a model. On ticket 02 the agent
+says it is done but leaves a criterion unticked; the runner notices and retries the step.*
+
+## Why
+
+Leaving an agent alone with a list of tickets goes wrong in predictable ways. It drifts
+from ticket to ticket in one long context. It says the tests pass when they don't. It
+"finishes" a ticket with criteria still open. It hits a usage limit at 2 a.m. and the
+night is gone. It runs `git stash pop` and eats your stash. run-tickets is the loop around
+the agent that doesn't trust any of that:
+
+- **One ticket at a time, in blocker order, each step in a fresh agent process.** No
+  context carries over from one ticket or step to the next.
+- **Implement, then review.** The review fixes findings, ticks only the criteria that are
+  really met and sets the ticket to `done`. A ticket whose result is not code (a report, a
+  test-bench run) is verified instead.
+- **The runner checks everything itself** after every step: the ticket's status and
+  checkboxes, commits, a clean tree, your stash, the branch, the history, and your test
+  command. A failed check means a retry in a fresh process with the reason, or a stop.
+- **Crash-safe.** State is written atomically before and after each step. Run the same
+  command after Ctrl+C, `kill -9` or a power cut, and it resumes at the same step.
+- **Unattended nights:** provider limits are waited out, timeouts kill the whole agent
+  process tree, and in the morning a summary says what was done, where it stopped and why.
+- **Local only.** The result is a branch in your repository; pushing it is up to you.
+
+It works on **Linux, macOS and Windows** with Python 3.9+ and git, and has no other
+dependencies. It drives **Claude Code, Codex, omp and pi** out of the box, and any other
+CLI agent through config. Each step can use its own agent and model.
+
+## Quick start
 
 ```bash
-# 1. Установить один раз (нужен uv: https://docs.astral.sh/uv/)
+# 1. Install once (needs uv: https://docs.astral.sh/uv/)
 uv tool install git+https://github.com/omanei/run-tickets
 
-# 2. В корне проекта создать конфиг и проверить, что получилось
+# 2. In your project root: write a config and see what the runner would do
 cd ~/work/my-project
-run-tickets init --agent omp
+run-tickets init --agent claude
 run-tickets config .scratch/my-feature --prompts
 
-# 3. Запустить
+# 3. Run
 run-tickets run .scratch/my-feature
 ```
 
-Утром достаточно открыть `.scratch/my-feature/runs/SUMMARY.md` или выполнить
+In the morning, open `.scratch/my-feature/runs/SUMMARY.md` or run
 `run-tickets status .scratch/my-feature`.
 
-## Установка
+**Try it without a model:** clone this repository and run `python examples/demo.py`. It
+creates a throwaway git repository with an example feature (`examples/demo`: a spec and three
+tickets) and runs it with a stand-in agent. Your repositories are not touched.
 
-Класть скрипт в определённую папку не нужно. Раннеру передаётся путь к каталогу фичи, а
-git-репозиторий он находит сам по этому пути. Запускать его можно из любого каталога.
+## How it works
 
-### 1. Как команду: рекомендуется
+```
+ next ticket ─▶ implement ─▶ checks + tests ─▶ review / verify ─▶ checks + tests ─▶ done
+       ▲           │ fail: retry  │ provider limit: wait               │
+       └───────────┴──────────────┴──── state.json keeps the step and base ┘
+ all done ─▶ final review of the feature ─▶ tests ─▶ branch in your repo ─▶ notification
+```
+
+- **implement** runs the agent's implement skill on the ticket and commits.
+- **review** runs the code-review skill on the ticket's commits: fix findings, run the
+  tests, tick only what is met, set `Status: done`.
+- **verify** replaces review when the implement step made no commits (the result lives
+  outside git): read the ticket and the files it names, check each criterion against what
+  exists, tick, finish what is missing, set `done` or `needs-info`.
+- **final review** looks at the whole feature against the spec once every ticket is done.
+
+## Installation
+
+The runner does not need to live in any particular folder. You give it the feature
+directory, and it finds the git repository from there, so it runs from anywhere.
+
+### 1. As a command (recommended)
 
 ```bash
-uv tool install git+https://github.com/omanei/run-tickets      # или:
+uv tool install git+https://github.com/omanei/run-tickets      # or:
 pipx install    git+https://github.com/omanei/run-tickets
 ```
 
 | | uv | pipx |
 |---|---|---|
-| обновить | `uv tool upgrade run-tickets` | `pipx upgrade run-tickets` |
-| удалить | `uv tool uninstall run-tickets` | `pipx uninstall run-tickets` |
+| upgrade | `uv tool upgrade run-tickets` | `pipx upgrade run-tickets` |
+| uninstall | `uv tool uninstall run-tickets` | `pipx uninstall run-tickets` |
 
-- Если репозиторий приватный, используйте адрес `git+ssh://git@github.com/omanei/run-tickets`.
-- Если после установки команда не находится, выполните `uv tool update-shell` или
-  `pipx ensurepath` и перезапустите терминал.
+If the command is not found after installing, run `uv tool update-shell` or
+`pipx ensurepath` and restart the terminal.
 
-### 2. Без установки
+### 2. Without installing
 
 ```bash
 uvx --from git+https://github.com/omanei/run-tickets run-tickets run .scratch/my-feature
 ```
 
-### 3. Одним файлом в проекте
+### 3. As a single file in your project
 
-Скопируйте `run_tickets.py` в репозиторий, например в `scripts/run_tickets.py`, и
-закоммитьте. Тогда у всей команды будет одна версия раннера.
+Copy `run_tickets.py` into your repository, for example as `scripts/run_tickets.py`, and
+commit it, so the whole team uses the same version.
 
 ```bash
 python scripts/run_tickets.py run .scratch/my-feature     # Windows: py scripts\run_tickets.py …
-uv run scripts/run_tickets.py run .scratch/my-feature     # uv сам подберёт Python
+uv run scripts/run_tickets.py run .scratch/my-feature     # uv picks the Python for you
 ```
 
-Зависимость `tomli` для Python ниже 3.11 указана прямо в файле
-([PEP 723](https://peps.python.org/pep-0723/)), и `uv run` поставит её сам.
+The file declares its one dependency (`tomli`, for Python below 3.11) inline
+([PEP 723](https://peps.python.org/pep-0723/)), and `uv run` installs it.
 
-## Использование
+## Usage
 
 ```bash
-run-tickets run    <feature> [<feature> …]  # до конца, до блокировки, паузы или остановки
-run-tickets run    <feature> --once         # ровно один тикет
-run-tickets status <feature> [--watch]      # что сделано, что идёт сейчас, где и почему встал
-run-tickets config <feature> [--prompts]    # итоговые настройки, команды агентов, промпты
-run-tickets retry  <feature> 05             # повторить шаг, на котором встал тикет 05
-run-tickets reset  <feature> 05             # сделать 05 заново с нуля
-run-tickets skip   <feature> 05 --reason …  # пометить 05 как wontfix с комментарием
-run-tickets adopt  <feature> --feature-base <sha> [--resume 16:review:<sha>]  # перенять фичу
-run-tickets init   [--agent claude]         # создать .ticket-runner.toml в корне репозитория
+run-tickets run    <feature> [<feature> …]  # until done, blocked, paused or stopped
+run-tickets run    <feature> --once         # exactly one ticket
+run-tickets status <feature> [--watch]      # done / running now / where and why it stopped
+run-tickets config <feature> [--prompts]    # effective settings, agent commands, prompts
+run-tickets retry  <feature> 05             # rerun the step ticket 05 stopped at
+run-tickets reset  <feature> 05             # do 05 again from scratch
+run-tickets skip   <feature> 05 --reason …  # mark 05 wontfix with a comment
+run-tickets adopt  <feature> --feature-base <sha> [--resume 16:review:<sha>]  # take over a feature
+run-tickets init   [--agent claude]         # write .ticket-runner.toml in the repo root
 ```
 
-У `run` и `config` есть флаги, которые важнее конфига:
+`run` and `config` take flags that win over the config file:
 
-| Флаг | Что делает |
+| Flag | What it does |
 |---|---|
-| `--agent`, `--model` | агент и модель для всех шагов |
-| `--max-time 2h` | лимит времени на шаг |
-| `--retries 1` | сколько раз повторять проваленный шаг |
-| `--test-command "make test"` | команда тестов |
-| `--branch feat/{{feature}}` | ветка для работы |
-| `--worktree` | работать в отдельном `git worktree` |
-| `--no-final-review` | без финального ревью фичи |
-| `--pause-after 03` | остановиться после тикета 03 |
-| `--config <файл>` | взять конфиг из указанного файла |
+| `--agent`, `--model` | agent and model for every step |
+| `--max-time 2h` | time limit per step |
+| `--retries 1` | how many times to retry a failed step |
+| `--test-command "make test"` | the tests the runner runs |
+| `--branch feat/{{feature}}` | the branch to work on |
+| `--worktree` | work in a separate `git worktree` |
+| `--no-final-review` | skip the review of the whole feature |
+| `--pause-after 03` | stop after ticket 03 |
+| `--config <file>` | use this config file |
 
-Только у `run`:
-- `--keep-going`: при очереди фич переходить к следующей после остановки;
-- `--adopt-dirty`: после падения продолжить с незакоммиченными правками агента;
-- `--dry-run`: то же, что `status`.
+`run` only:
+- `--keep-going`: with several features, go on to the next after a stop;
+- `--adopt-dirty`: after a crash, let the agent continue with its uncommitted edits;
+- `--dry-run`: same as `status`.
 
-`retry`, `reset` и `skip` понимают номер (`5`, `05`) и имя (`05-slug`). С аргументом `final`
-они относятся к финальному ревью.
+`retry`, `reset` and `skip` take a number (`5`, `05`) or a name (`05-slug`); `final` means
+the final review.
 
-Коды выхода:
+Exit codes:
 
-| Код | Значение |
+| Code | Meaning |
 |---|---|
-| `0` | все тикеты сделаны |
-| `1` | остановка на проверке |
-| `2` | ошибка запуска |
-| `3` | запускать нечего, но открытые тикеты остались |
-| `4` | пауза по `pause_after` |
-| `130` | прервано |
+| `0` | every ticket is done |
+| `1` | stopped on a failed check |
+| `2` | usage or setup error |
+| `3` | nothing runnable, but tickets are still open |
+| `4` | paused (`pause_after`) |
+| `130` | interrupted |
 
-### Ночной запуск
+### Overnight runs
 
-Агент работает часами. Раннер должен пережить закрытие терминала, а машина не должна уснуть:
+The agent works for hours, so the runner should survive a closed terminal and the machine
+should not sleep:
 
 ```bash
 # macOS
 nohup caffeinate -i run-tickets run .scratch/my-feature > run.out 2>&1 &
 # Linux
 nohup systemd-inhibit run-tickets run .scratch/my-feature > run.out 2>&1 &
-# Windows (PowerShell): отключите сон в настройках электропитания и оставьте окно открытым
+# Windows (PowerShell): turn off sleep in the power settings and leave the window open
 run-tickets run .scratch\my-feature
 ```
 
-Посмотреть, что раннер делает прямо сейчас, можно из другого терминала:
-`run-tickets status .scratch/my-feature --watch`. Там видно текущий шаг, сколько он идёт и
-последнее действие агента.
+To see what the runner is doing right now, run
+`run-tickets status .scratch/my-feature --watch` in another terminal. It shows the current
+step, how long it has been running and the agent's last action.
 
-Если что-то оборвалось, запустите ту же команду ещё раз.
+If anything is cut off, run the same command again. Several features run one after
+another: `run-tickets run .scratch/feat-a .scratch/feat-b`.
 
-Несколько фич выполняются по очереди одной командой:
-`run-tickets run .scratch/feat-a .scratch/feat-b`.
+## Fully unattended setup
 
-## Полностью автоматический режим
-
-Конфиг, который проводит фичу от тикетов до готовой ветки без участия человека:
+A config that takes a feature from tickets to a finished branch without a human:
 
 ```toml
 agent = "claude"
-test_command = "make test"          # раннер сам гоняет тесты после каждого шага
+test_command = "make test"          # the runner runs the tests after every step
 
 branch = "feat/{{feature}}"
-worktree = true                     # ваша рабочая копия не трогается всю ночь
+worktree = true                     # your own checkout stays untouched all night
 worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "make deps"]
 
-max_cost = 50                       # долларов за ночь (агенты, сообщающие стоимость)
+max_cost = 50                       # USD per run (agents that report cost)
 protected = ["migrations/", ".github/"]
 notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
 ```
 
-## Возможности
+## Features
 
-### Тесты запускает раннер, а не агент
+### The runner runs the tests, not the agent
 
-Если задан `test_command`, раннер сам запускает его после каждого шага. Если тесты не прошли,
-шаг считается проваленным. При повторе агент получает конец вывода тестов.
+With `test_command` set, the runner runs it itself after every step. If the tests fail, the
+step fails, and the retry gets the end of the test output.
 
-Перед первым шагом тикета тесты прогоняются ещё раз, для базовой проверки (`test_baseline`).
-Если они падают уже там, раннер останавливается до запуска агента: виноваты база или
-окружение, а не агент. Лимит времени на тесты — `test_timeout`.
+The tests also run before a ticket starts (`test_baseline`). If they already fail there, the
+runner stops before any agent starts: the base or the environment is broken, not the
+agent's work. `test_timeout` limits a test run.
 
-### Лимиты провайдера
+### Provider limits
 
-Агент может упасть из-за исчерпанного лимита: «usage limit», «rate limit», «429» и т. п. В этом
-случае раннер не тратит попытку, а ждёт и перезапускает тот же шаг. Время ожидания берётся из
-сообщения агента: «resets 3am», «try again in 15 minutes», метка времени и т. п. Если в
-сообщении его нет, раннер ждёт `limit_default_wait`. Суммарное ожидание на шаг ограничено
-`limit_max_wait`.
+When the agent fails on a usage or rate limit ("usage limit", "rate limit", "429", …), the
+runner does not spend a retry. It waits and reruns the same step. The wait comes from the
+agent's message ("resets 3am", "try again in 15 minutes", a timestamp), or
+`limit_default_wait` when the message names none. `limit_max_wait` caps the total wait per
+step.
 
-### Ветка и worktree: всё локально
+### Branch and worktree, all local
 
-Раннер ничего не пушит и никуда не ходит, кроме вашего агента. Результат — ветка в вашем
-репозитории.
+The runner never pushes and never talks to a server; only your agent does. The result is a
+branch in your repository.
 
-- `branch = "feat/{{feature}}"` — работать в отдельной ветке. Раннер создаёт её от текущей.
-- `worktree = true` — работать в отдельном `git worktree`, по умолчанию в
-  `../<repo>-worktrees/<feature>`. Worktree — это вторая рабочая папка того же репозитория:
-  история и ветки общие, но ваша рабочая копия, ваша ветка и stash всю ночь недоступны агенту.
-  Вы можете продолжать работать в своей копии.
-- `worktree_setup` — команды, которые один раз выполняются в новом worktree. Там есть только
-  отслеживаемые файлы, поэтому `.env`, зависимости и виртуальное окружение нужно принести
-  отдельно. Если команда упала, раннер повторит её при следующем запуске.
-- Когда все тикеты и финальное ревью готовы, раннер удаляет папку worktree, а ветка
-  остаётся в репозитории. Если в worktree остались незакоммиченные файлы, папка не удаляется,
-  а в отчёте написано, что в ней осталось. Пока работа не закончена, worktree остаётся на
-  месте, чтобы следующий запуск продолжил с того же шага.
+- `branch = "feat/{{feature}}"` works on a separate branch, created from the current one.
+- `worktree = true` works in a separate `git worktree`, by default
+  `../<repo>-worktrees/<feature>`. A worktree is a second folder of the same repository:
+  history and branches are shared, but your checkout, your branch and your stash are out of
+  the agent's reach all night, and you can keep working in your checkout.
+- `worktree_setup` runs commands once in a new worktree. It only has tracked files, so
+  `.env`, dependencies and virtualenvs need bringing in. A failed command is repeated on the
+  next run.
+- When every ticket and the final review are done, the runner removes the worktree folder
+  and the branch stays in the repository. A worktree with uncommitted files is kept, and the
+  report says what is in it. Until the work is finished, the worktree stays, so the next run
+  resumes where it stopped.
 
-В конце раннер подсказывает, что делать с веткой:
+At the end the runner shows what to do with the branch:
 
 ```bash
-git log --oneline main..feat/my-feature    # что сделано
-git diff main...feat/my-feature            # весь diff
-git merge feat/my-feature                  # влить локально
-git push -u origin feat/my-feature         # или отправить на сервер и открыть PR самому
+git log --oneline main..feat/my-feature    # what was done
+git diff main...feat/my-feature            # the whole diff
+git merge feat/my-feature                  # merge it locally
+git push -u origin feat/my-feature         # or push it and open a PR yourself
 ```
 
-Тикеты и `runs/` всегда лежат в вашей рабочей копии, а код пишется в рабочем дереве раннера.
+The tickets and `runs/` always live in your checkout; the code is written in the runner's
+working tree.
 
-> **Когда `worktree = true` не подходит.** Проверьте, где ваш проект гоняет тесты. Если в
-> Docker-контейнере, который монтирует основную рабочую копию (volume на папку
-> репозитория), то и агент, и `test_command`, и `preflight` запустят тесты внутри контейнера.
-> А там лежит код вашей копии, а не worktree. Тесты будут зелёными на старом коде, и раннер
-> примет непроверенную работу. Для таких проектов оставьте `worktree = false` и работайте в
-> ветке (`branch = "feat/{{feature}}"`) в основной копии. Другой вариант — поднять для
-> worktree свой контейнер, смонтированный на папку worktree (через `worktree_setup` и
-> `test_command`).
+> **When `worktree = true` does not fit.** Check where your project runs its tests. If they
+> run in a Docker container that mounts your main checkout (a volume on the repository
+> folder), the agent, `test_command` and `preflight` all test the code of your checkout, not
+> the worktree's. The tests pass on the old code, and the runner accepts unchecked work. For
+> such projects keep `worktree = false` and work on a branch in your main checkout
+> (`branch = "feat/{{feature}}"`), or start a separate container that mounts the worktree
+> folder (through `worktree_setup` and `test_command`).
 
-### Тикеты без кода: шаг verify
+### Tickets without code: the verify step
 
-Результат некоторых тикетов лежит вне git: отчёт, прогон стенда, новые тикеты. Implement
-такого тикета может закончиться без коммитов, и это не провал. Если между базой тикета и
-HEAD нет коммитов, раннер вместо code-review запускает шаг `verify`. Агент с чистым
-контекстом читает тикет, его `## Comments` и все файлы, которые тот называет. Затем он
-сверяет каждый `- [ ]` с тем, что есть на самом деле (слова implement доказательством не
-считаются), отмечает выполненное, доделывает недостающее и ставит `done` или `needs-info`.
+Some tickets produce a result outside git: a report, a test-bench run, new tickets. Their
+implement step may end with no commits, and that is not a failure. When there are no
+commits between the ticket's base and HEAD, the runner runs a `verify` step instead of a
+code review. A fresh agent reads the ticket, its `## Comments` and every file it names,
+checks each `- [ ]` against what actually exists (the implement step's word is not
+evidence), ticks what is met, finishes what is missing and sets `done` or `needs-info`.
 
-После verify раннер проверяет то же, что после review: статус `done`, ни одного `- [ ]`,
-чистое дерево, тесты.
+After verify the runner checks what it checks after a review: status `done`, no `- [ ]`
+left, a clean tree, the tests.
 
-Строка `**Kind:** report` в тикете отправляет его на verify всегда, даже если implement что-то
-закоммитил (например, сам файл отчёта). Агент implement тогда получает в промпте пометку, что
-результат тикета — отчёт, а не код.
+`**Kind:** report` in a ticket always sends it to verify, even when implement committed
+something (the report file itself, say), and tells the implement agent that the ticket's
+result is a report, not code.
 
-У шага verify те же агент и модель, что у review. Отдельно их можно задать в
-`[steps.verify]`.
+Verify uses the review step's agent and model unless `[steps.verify]` sets its own.
 
-### Финальное ревью фичи
+### Final review of the feature
 
-Каждый тикет проверяется отдельно, и стыки между тикетами в эти проверки не попадают. Поэтому
-после последнего тикета раннер запускает ещё одно ревью (`final_review = true`, по умолчанию
-включено). Оно смотрит изменения `since <база фичи>` против `spec.md`:
-- что из спеки не покрыл ни один тикет;
-- несостыковки и дубли между тикетами;
-- забытую связку частей.
+Each ticket is reviewed on its own, so the seams between tickets go unchecked. After the
+last ticket the runner runs one more review (`final_review = true`, on by default) of the
+changes `since <feature base>` against `spec.md`:
+- what the spec asks for that no ticket covered;
+- mismatches and duplication between tickets;
+- missing wiring between the parts.
 
-Затем агент прогоняет все тесты. Раннер проверяет результат финального ревью так же, как
-обычный шаг. Повторно оно не запускается, пока HEAD не изменился.
+The agent then runs the full test suite. The runner checks the final review like any step,
+and does not run it again until HEAD changes.
 
-### Разные агенты и модели на шаги
+### A different agent or model per step
 
 ```toml
 [steps.implement]
 model = "opus"
 [steps.review]
-agent = "codex"        # ревью другой моделью находит то, что автор пропустил
+agent = "codex"        # a review by another model catches what the author missed
 max_time = "1h"
 [steps.final]
 model = "opus"
 ```
 
-### Бюджет
+### Budget
 
-- `max_cost` — сколько долларов можно потратить за запуск. Когда бюджет исчерпан, следующий
-  шаг не начинается.
-- `max_step_cost` — лимит на один шаг. Передаётся агенту, если тот принимает такой флаг
-  (у `claude` это `--max-budget-usd`).
+- `max_cost`: how many dollars a run may spend. Once spent, the next step does not start.
+- `max_step_cost`: a limit per step, passed to agents that take one (`--max-budget-usd` for
+  `claude`).
 
-Стоимость сейчас сообщает только `claude`. Она видна в REPORT.md и SUMMARY.md.
-`run-tickets config` предупреждает, если у выбранного агента бюджет не работает.
+Only `claude` reports cost so far. It shows up in REPORT.md and SUMMARY.md, and
+`run-tickets config` warns when the chosen agent's budget does not apply.
 
-### Защищённые пути и ослабленные тесты
+### Protected paths and weakened tests
 
-- `protected = ["migrations/", ".github/", "*.lock"]` — если агент тронул такой путь, раннер
-  сразу останавливается, без повтора.
-- В отчёте раннер выделяет добавленные `skip`, `xfail`, `@Disabled`,
-  `#[ignore]`. Ещё он выделяет строки тестов, где поменялось только число (поднятый порог или
-  лимит), например `BUDGET = 100 -> BUDGET = 200`.
+- `protected = ["migrations/", ".github/", "*.lock"]`: if the agent touches such a path, the
+  run stops at once, without a retry.
+- The report flags added `skip`, `xfail`, `@Disabled`, `#[ignore]` and the like, and test
+  lines where only a number changed (a raised threshold or limit), for example
+  `BUDGET = 100 -> BUDGET = 200`.
 
-### Пауза для человека
+### A pause for a human
 
-`pause_after = ["03"]` или `--pause-after 03` останавливает раннер после тикета 03: можно
-посмотреть промежуточный результат. Раннер выходит с кодом 4. Следующий запуск продолжает со
-следующего тикета.
+`pause_after = ["03"]` or `--pause-after 03` stops after ticket 03, so you can look at the
+work so far. The runner exits with code 4; the next run continues with the next ticket.
 
-### Утренняя сводка и уведомления
+### Morning summary and notifications
 
-`runs/SUMMARY.md` обновляется после каждого тикета и в конце. В нём итог, сколько тикетов
-сделано, стоимость, ветка и таблица по тикетам.
+`runs/SUMMARY.md` is updated after every ticket and at the end: the outcome, how many
+tickets are done, cost, branch and a table of tickets.
 
-Уведомления приходят коротким сообщением, например: «my-feature: 7/9 done; stopped - at
-08-export (review): …; $12.30».
-- Локально: macOS, `notify-send` или всплывающее окно Windows.
-- Куда угодно: через `notify_command`. Текст сообщения в `$RUN_TICKETS_MESSAGE`, пути к
-  сводке и отчёту в `$RUN_TICKETS_SUMMARY` и `$RUN_TICKETS_REPORT`.
+Notifications are one short line, for example: "my-feature: 7/9 done; stopped - at
+08-export (review): …; $12.30".
+- Locally: a macOS notification, `notify-send`, or a Windows balloon.
+- Anywhere else: `notify_command`, with the text in `$RUN_TICKETS_MESSAGE` and the paths of
+  the summary and the report in `$RUN_TICKETS_SUMMARY` and `$RUN_TICKETS_REPORT`.
 
-### Чистка логов
+### Log cleanup
 
-При каждом запуске раннер удаляет из `runs/` логи, транскрипты, сессии и промпты старше
-`log_retention` (по умолчанию 30 дней). Если `runs/` больше `log_max_mb`, раннер удаляет и
-более свежие файлы, начиная с самых старых, но не моложе суток. `REPORT.md`, `SUMMARY.md`,
-`state.json` и `events.jsonl` не удаляются никогда.
+On every run the runner deletes logs, transcripts, sessions and prompts in `runs/` older
+than `log_retention` (30 days by default). If `runs/` is still over `log_max_mb`, it deletes
+the oldest files first, but nothing from the last day. `REPORT.md`, `SUMMARY.md`,
+`state.json` and `events.jsonl` are never deleted.
 
-## Настройка
+## Configuration
 
-Всё настраивается в одном файле **`.ticket-runner.toml`**. Обычно он лежит в корне
-репозитория и коммитится, тогда настройки общие для команды. Если фиче нужны свои настройки,
-положите отдельный файл в её каталог.
+Everything is set in one file, **`.ticket-runner.toml`**. It usually lives in the repository
+root and is committed, so the team shares the settings. A feature that needs its own
+settings gets its own file in its directory.
 
-Где раннер ищет конфиг, по убыванию приоритета:
+Where the runner looks, highest priority first:
 
-1. флаги командной строки;
-2. файл из `--config <путь>`;
-3. `<каталог фичи>/.ticket-runner.toml`;
-4. `<корень репозитория>/.ticket-runner.toml`;
-5. значения по умолчанию.
+1. command-line flags;
+2. the file given with `--config <path>`;
+3. `<feature dir>/.ticket-runner.toml`;
+4. `<repo root>/.ticket-runner.toml`;
+5. the defaults.
 
-Файлы не сливаются: раннер берёт первый найденный.
+Files are not merged: the first one found is used.
 
-- `run-tickets init` создаёт файл, где все ключи с умолчаниями закомментированы и объяснены.
-- `run-tickets config <feature>` показывает, какой файл подхватился, откуда взялось каждое
-  значение и какой командой будет запущен агент на каждом шаге.
-- Если в конфиге опечатка в ключе, раннер не запустится, а не проигнорирует её молча.
+- `run-tickets init` writes a file with every key commented out at its default, with an
+  explanation.
+- `run-tickets config <feature>` shows which file was picked up, where each value comes from
+  and the exact command each step runs.
+- A misspelled key is an error, not silently ignored.
 
-### Ключи
+### Keys
 
-| Ключ | По умолчанию | Что делает |
+| Key | Default | What it does |
 |---|---|---|
-| `agent` | `"omp"` | `omp`, `pi`, `claude`, `codex` или имя из `[agents.<имя>]` |
-| `model` | `""` | модель, передаётся агенту (если задана) |
-| `max_time` | `"3h"` | лимит на шаг; потом раннер убивает агента со всеми дочерними процессами |
-| `retries` | `1` | сколько раз повторить проваленный шаг в новом процессе |
-| `retry_delay` | `"1m"` | пауза перед повтором |
-| `test_command` | `""` | тесты, которые раннер запускает сам после каждого шага |
-| `test_timeout` | `"30m"` | лимит на прогон тестов |
-| `test_baseline` | `true` | прогонять тесты и перед тикетом |
-| `limit_wait` | `true` | ждать снятия лимита провайдера вместо остановки |
-| `limit_default_wait` | `"30m"` | сколько ждать, если агент не назвал время сброса |
-| `limit_max_wait` | `"12h"` | предел ожидания на шаг |
-| `branch` | `""` | ветка, например `"feat/{{feature}}"`; пусто = текущая |
-| `worktree` | `false` | работать в отдельном `git worktree`; в конце он удаляется, ветка остаётся |
-| `worktree_dir` | `"{{repo}}/../{{repo_name}}-worktrees/{{feature}}"` | где он лежит |
-| `worktree_setup` | `[]` | команды для нового worktree |
-| `final_review` | `true` | финальное ревью всей фичи |
-| `pause_after` | `[]` | после каких тикетов остановиться |
-| `max_cost` | `0` | долларов за запуск; `0` — без лимита |
-| `max_step_cost` | `0` | долларов на шаг, для агентов с флагом бюджета |
-| `protected` | `[]` | пути, которые агенту трогать нельзя |
-| `log_retention` | `"30d"` | сколько хранить логи; `"0"` — всегда |
-| `log_max_mb` | `2000` | предел размера `runs/` |
-| `report_heading` | `"Step report"` | заголовок отчёта модели, например `"Отчёт о шаге"` |
-| `report_language` | `"English"` | язык отчёта, например `"Russian"` |
-| `preflight` | `[]` | команды, которые должны пройти перед стартом и перед каждым тикетом |
-| `notify_command` | `""` | команда уведомления |
-| `desktop_notify` | `true` | системные уведомления |
-| `extra_instructions` | `""` | правила проекта для implement и review |
-| `review_extra_instructions` | `""` | правила только для review |
-| `final_review_extra_instructions` | `""` | правила для финального ревью |
-| `[skills] implement`, `review` | `"implement"`, `"code-review"` | имена скиллов; у плагинов Claude Code с префиксом: `"<плагин>:code-review"` |
-| `[steps.<шаг>]` | — | `agent`, `model`, `max_time` для `implement`, `review`, `verify` (по умолчанию как у `review`) или `final` |
-| `[agents.<имя>]` | пресеты | своя команда агента |
-| `[prompts]` | встроенные | полная замена шаблонов `common`, `implement`, `review`, `final` |
+| `agent` | `"omp"` | `omp`, `pi`, `claude`, `codex` or a name from `[agents.<name>]` |
+| `model` | `""` | model passed to the agent, when set |
+| `max_time` | `"3h"` | per step; then the runner kills the agent and all its child processes |
+| `retries` | `1` | how many times to retry a failed step in a fresh process |
+| `retry_delay` | `"1m"` | pause before a retry |
+| `test_command` | `""` | tests the runner runs itself after every step |
+| `test_timeout` | `"30m"` | limit on a test run |
+| `test_baseline` | `true` | also run the tests before each ticket |
+| `limit_wait` | `true` | wait out a provider limit instead of stopping |
+| `limit_default_wait` | `"30m"` | how long to wait when the agent names no reset time |
+| `limit_max_wait` | `"12h"` | cap on waiting per step |
+| `branch` | `""` | branch, e.g. `"feat/{{feature}}"`; empty = the current one |
+| `worktree` | `false` | work in a separate `git worktree`; removed at the end, the branch stays |
+| `worktree_dir` | `"{{repo}}/../{{repo_name}}-worktrees/{{feature}}"` | where it lives |
+| `worktree_setup` | `[]` | commands for a new worktree |
+| `final_review` | `true` | final review of the whole feature |
+| `pause_after` | `[]` | tickets to stop after |
+| `max_cost` | `0` | USD per run; `0` = no limit |
+| `max_step_cost` | `0` | USD per step, for agents with a budget flag |
+| `protected` | `[]` | paths the agent must not touch |
+| `log_retention` | `"30d"` | how long to keep logs; `"0"` = forever |
+| `log_max_mb` | `2000` | size cap for `runs/` |
+| `report_heading` | `"Step report"` | heading of the model's report |
+| `report_language` | `"English"` | language of the report |
+| `preflight` | `[]` | commands that must pass before the run and before each ticket |
+| `notify_command` | `""` | notification command |
+| `desktop_notify` | `true` | system notifications |
+| `extra_instructions` | `""` | project rules for implement and review |
+| `review_extra_instructions` | `""` | rules for review (and verify) only |
+| `final_review_extra_instructions` | `""` | rules for the final review |
+| `[skills] implement`, `review` | `"implement"`, `"code-review"` | skill names; Claude Code plugin skills carry the plugin prefix: `"<plugin>:code-review"` |
+| `[steps.<step>]` | — | `agent`, `model`, `max_time` for `implement`, `review`, `verify` (defaults to review's) or `final` |
+| `[agents.<name>]` | presets | your own agent command |
+| `[prompts]` | built in | replace the `common`, `implement`, `review`, `verify`, `final` templates |
 
-### Агенты
+### Agents
 
-| `agent` | Что запускается | Вызов скилла |
+| `agent` | What runs | Skill call |
 |---|---|---|
 | `omp` | `omp -p --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
 | `pi` | `pi -p --session-dir … "<prompt>"` | `/skill:implement …` |
-| `claude` | `claude -p --output-format stream-json --verbose --permission-mode bypassPermissions`, промпт через stdin | `/implement …` |
-| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox -C … -` | текстом |
+| `claude` | `claude -p --output-format stream-json --verbose --permission-mode bypassPermissions`, prompt on stdin | `/implement …` |
+| `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox -C … -` | in words |
 
-Пресет `codex` экспериментальный.
+The `codex` preset is experimental.
 
-От агента нужны три вещи: неинтерактивный режим, отсутствие вопросов на подтверждение и
-установленные скиллы. Свой агент или изменённый пресет задаётся так:
+An agent needs three things: a non-interactive mode, no approval prompts, and the skills
+installed. Your own agent, or a changed preset:
 
 ```toml
 [agents.my-agent]
 command = ["my-agent", "--yes", "--workdir", "{{repo}}", "{{model_args}}", "{{prompt}}"]
-model_args = ["--model", "{{model}}"]   # на место {{model_args}}, только если задана model
-budget_args = []                         # на место {{budget_args}}, если задан max_step_cost
-prompt_via = "arg"                       # "arg" или "stdin"
-skill_format = "/{{skill}} {{args}}"     # как агент вызывает скилл
-output = "text"                          # или "claude-stream-json"
-export_command = []                      # выгрузка HTML-транскрипта, если есть
+model_args = ["--model", "{{model}}"]   # at {{model_args}}, only when a model is set
+budget_args = []                         # at {{budget_args}}, when max_step_cost is set
+prompt_via = "arg"                       # "arg" or "stdin"
+skill_format = "/{{skill}} {{args}}"     # how the agent calls a skill
+output = "text"                          # or "claude-stream-json"
+export_command = []                      # HTML transcript export, if the agent has one
 ```
 
-## Формат тикетов
+## Ticket format
 
-Формат такой, какой пишет `/to-tickets` при локальном трекере:
+The format `/to-tickets` writes for a local tracker:
 
 ```
 .scratch/<feature>/
   spec.md
   issues/01-<slug>.md, 02-<slug>.md, …
-  runs/            ← создаёт раннер
+  runs/            ← created by the runner
 ```
 
 ```markdown
-# 02: Пользователь экспортирует отчёт
+# 02: User exports a report
 
 **What to build:** …
 
@@ -417,158 +452,171 @@ export_command = []                      # выгрузка HTML-транскр�
 
 **Status:** ready-for-agent
 
-- [ ] Критерий приёмки 1
-- [ ] Критерий приёмки 2
+- [ ] Acceptance criterion 1
+- [ ] Acceptance criterion 2
 ```
 
-**Статус.** Раннер понимает три записи: `**Status:** x`, `**Status**: x` и `Status: x`.
+**Status.** `**Status:** x`, `**Status**: x` and `Status: x` are all understood.
 
-**Тип.** Необязательная строка `**Kind:** report` помечает тикет, результат которого не код
-(см. «Тикеты без кода: шаг verify»).
+**Kind.** An optional `**Kind:** report` marks a ticket whose result is not code (see the
+verify step).
 
-**Блокеры.**
-- **Номером:** `04`, `#4`, `03-slug`. Номера задач вида `PROJ-1234` за блокеры не считаются.
-- **Названием тикета:** `/to-tickets` так тоже пишет.
-- **Разделом `## Blocked by`** со списком.
-- **Без блокеров:** `None (can start immediately)`.
-- **Нераспознанный текст:** тикет ждёт и не запускается раньше времени, а `status`
-  показывает этот текст.
+**Blockers.**
+- **By number:** `04`, `#4`, `03-slug`. Issue keys like `PROJ-1234` do not count as blockers.
+- **By ticket title**, which `/to-tickets` also writes.
+- **A `## Blocked by` section** with a list.
+- **None:** `None (can start immediately)`.
+- **Text it cannot recognise:** the ticket waits instead of starting early, and `status`
+  shows the text.
 
-**Порядок.** Запускается тикет со статусом `ready-for-agent`, у которого все блокеры в `done`.
-Если таких несколько, первым идёт тикет с меньшим номером.
+**Order.** A ticket runs when its status is `ready-for-agent` and all its blockers are
+`done`; the lowest number goes first.
 
-**Открытые тикеты.** Тикеты в `needs-info`, `needs-triage`, `ready-for-human` и без статуса
-не пропадают. Они и всё, что от них зависит, остаются в списке открытых, и раннер выходит с
-кодом 3.
+**Open tickets.** Tickets in `needs-info`, `needs-triage`, `ready-for-human` or without a
+status are not dropped. They, and everything that depends on them, stay in the list of open
+tickets, and the runner exits with code 3.
 
-**Тикеты, которые заводит агент.** Если агент во время шага создаёт новые тикеты в `issues/`
-(например, отчётный тикет заводит доработки по итогам прогона), раннер их не берёт. Промпт
-велит ставить им `**Status:** needs-triage`, а раннер после шага проверяет это сам: любому
-новому тикету с другим статусом он выставляет `needs-triage` и пишет об этом в `REPORT.md`.
-Такие тикеты ждут человека. Фича с ними считается незаконченной, поэтому финальное ревью не
-начинается, пока вы их не разберёте: поставьте `ready-for-agent`, `wontfix` или удалите.
+**Tickets the agent creates.** If an agent creates tickets in `issues/` during a step (a
+report ticket filing follow-ups, say), the runner does not pick them up. The prompt tells
+the agent to give them `**Status:** needs-triage`, and the runner enforces it after the
+step: any new ticket with another status is set to `needs-triage`, and REPORT.md says so.
+They wait for a human; until they are triaged (`ready-for-agent`, `wontfix` or deleted),
+the feature is not finished and the final review does not start.
 
-## Надёжность
+## Reliability
 
-Словам агента о состоянии репозитория раннер не верит и после каждого шага проверяет всё сам.
+The runner does not take the agent's word for the state of the repository. It checks for
+itself after every step.
 
-| Проверка | implement | review / verify | финальное ревью | При провале |
+| Check | implement | review / verify | final review | On failure |
 |---|---|---|---|---|
-| stash не изменился, ветка та же, история не переписана | ✔ | ✔ | ✔ | стоп сразу |
-| не тронуты пути из `protected` | ✔ | ✔ | ✔ | стоп сразу |
-| агент вышел с кодом 0 и уложился в `max_time` | ✔ | ✔ | ✔ | лимит провайдера: ждать; иначе повтор |
-| статус всё ещё `ready-for-agent` | ✔ | | | стоп сразу |
-| статус `done`, ни одного `- [ ]` | | ✔ | | повтор; если агент поставил `needs-info`, стоп сразу |
-| нет незакоммиченных изменений | ✔ | ✔ | ✔ | повтор |
-| `test_command` проходит | ✔ | ✔ | ✔ | повтор с выводом тестов в промпте |
+| stash unchanged, same branch, history not rewritten | ✔ | ✔ | ✔ | stop at once |
+| no `protected` path touched | ✔ | ✔ | ✔ | stop at once |
+| the agent exited with 0 within `max_time` | ✔ | ✔ | ✔ | provider limit: wait; otherwise retry |
+| status still `ready-for-agent` | ✔ | | | stop at once |
+| status `done`, no `- [ ]` left | | ✔ | | retry; stop at once if the agent set `needs-info` |
+| no uncommitted changes | ✔ | ✔ | ✔ | retry |
+| `test_command` passes | ✔ | ✔ | ✔ | retry, with the test output in the prompt |
 
-Implement без коммитов не провал: его результат проверяет шаг verify.
+An implement step without commits is not a failure: the verify step checks its result.
 
-**Повтор** — новый процесс агента. В промпт уходят причина провала, конец вывода тестов и
-отчёт прошлой попытки. Попыток всего `retries + 1`, после последней раннер останавливается.
+**A retry** is a fresh agent process, given the reason, the end of the test output and the
+previous attempt's report. There are `retries + 1` attempts; after the last one the run
+stops.
 
-**Состояние** хранится в `runs/state.json`. Раннер пишет его атомарно, перед каждым шагом и
-после него. Повторный запуск после `Ctrl+C`, `kill -9` или выключения питания:
+**State** lives in `runs/state.json`, written atomically before and after each step. Run the
+same command after Ctrl+C, `kill -9` or a power cut:
 
-- **Прерван implement.** implement перезапускается с той же базой, а агент узнаёт, что его
-  частичная работа лежит в коммитах.
-- **Прерван review, verify или финальное ревью.** Шаг перезапускается.
-- **Агент успел поставить `done`, но раннер умер до проверки.** Раннер сначала прогоняет
-  проверки, включая тесты. Непроверенным тикет не пропускается и заново не делается.
-- **Остались незакоммиченные правки.** Раннер не стартует: он не может отличить правки агента
-  от ваших. Если это правки агента, запустите с `--adopt-dirty`.
+- **implement was cut off:** implement reruns with the same base, and the agent is told its
+  partial work is in the commits.
+- **review, verify or the final review was cut off:** the step reruns.
+- **The agent set `done` but the runner died before checking it:** the runner runs the checks
+  first, tests included. The ticket is neither skipped unchecked nor done again.
+- **Uncommitted edits were left behind:** the runner refuses to start, since it cannot tell the
+  agent's edits from yours. If they are the agent's, run with `--adopt-dirty`.
 
-**Блокировки.** Одна ставится на фичу (`runs/.lock`), другая на рабочее дерево git. Второй
-экземпляр не запустится. Если процесс, оставивший блокировку, уже мёртв, она снимается сама.
+**Locks.** One per feature (`runs/.lock`) and one per git working tree keep a second runner
+out. A lock left by a dead process is taken over.
 
-## Что смотреть утром
+## What to read in the morning
 
-| Файл | Что там |
+| File | What is in it |
 |---|---|
-| `runs/SUMMARY.md` | итог: сколько сделано, где встал и почему, стоимость, ветка, таблица по тикетам |
-| `runs/REPORT.md` | по записи на шаг: результат или причина остановки, длительность, стоимость, тесты, коммиты, подозрительные изменения тестов, отчёт модели |
-| `runs/<тикет>-<шаг>-<время>.log` | полный вывод агента (у `claude` весь поток событий) |
-| `runs/<тикет>-<шаг>-tests-<время>.log` | вывод тестов, которые запускал раннер |
-| `runs/<тикет>-<шаг>-<время>.html` | транскрипт сессии со всеми вызовами инструментов (omp, pi) |
-| `runs/prompts/` | точный промпт каждого шага |
-| `runs/events.jsonl` | машиночитаемый журнал |
-| `runs/state.json` | где стоит каждый тикет |
+| `runs/SUMMARY.md` | the outcome: how much is done, where and why it stopped, cost, branch, a table of tickets |
+| `runs/REPORT.md` | an entry per step: result or reason for stopping, duration, cost, tests, commits, suspicious test changes, the model's report |
+| `runs/<ticket>-<step>-<time>.log` | the agent's full output (for `claude`, the whole event stream) |
+| `runs/<ticket>-<step>-tests-<time>.log` | output of the tests the runner ran |
+| `runs/<ticket>-<step>-<time>.html` | session transcript with every tool call (omp, pi) |
+| `runs/prompts/` | the exact prompt of each step |
+| `runs/events.jsonl` | a machine-readable log |
+| `runs/state.json` | where each ticket stands |
 
-## Частые вопросы
+## FAQ
 
-**Тикет встал. Как продолжить?** Исправьте причину и выполните `run-tickets retry <feature> 05`.
-Тикет вернётся в `ready-for-agent`, а следующий `run` продолжит с того шага, на котором
-встал.
+**A ticket stopped. How do I continue?** Fix the cause and run
+`run-tickets retry <feature> 05`. The ticket goes back to `ready-for-agent`, and the next
+`run` continues from the step it stopped at.
 
-**Как сделать тикет заново?** `run-tickets reset <feature> 05`: состояние стирается, галочки
-снимаются, тикет начнётся с implement.
+**How do I redo a ticket?** `run-tickets reset <feature> 05` clears its state and unticks
+its criteria; it starts again from implement.
 
-**Как перенять фичу, начатую другим раннером или вручную?** Используйте `run-tickets adopt`,
-править `state.json` руками не нужно:
+**How do I take over a feature another runner or a person started?** With
+`run-tickets adopt`, no hand-editing of `state.json`:
 
 ```bash
 run-tickets adopt .scratch/my-feature --feature-base <sha> --resume 16:review:<sha>
 ```
 
-- `--feature-base <sha>` — коммит перед первым тикетом фичи. От него финальное ревью смотрит
-  всю фичу.
-- `--resume NN:ФАЗА:<sha>` — продолжить тикет NN с фазы `implement`, `review` или `verify`.
-  `<sha>` — его база, то есть коммит перед его implement. Флаг можно повторять. Тикет
-  получает статус `ready-for-agent`. Если после базы нет коммитов, вместо `review`
-  запустится `verify`.
+- `--feature-base <sha>`: the commit before the feature's first ticket, the final review's
+  base.
+- `--resume NN:PHASE:<sha>`: continue ticket NN at `implement`, `review` or `verify`. `<sha>`
+  is its base, the commit before its implement step. Repeatable. The ticket becomes
+  `ready-for-agent`; with no commits after its base, `review` runs as `verify`.
 
-Готовые (`done`) тикеты перенимать не нужно: раннер видит их статус в файле.
+Done tickets need no adopting: the runner reads their status from the file.
 
-**Как пропустить тикет?** `run-tickets skip <feature> 05 --reason "…"`. Тикет станет
-`wontfix`, а причина запишется в его `## Comments`. Тикеты, которые от него зависят, будут
-ждать: блокер не `done`.
+**How do I skip a ticket?** `run-tickets skip <feature> 05 --reason "…"`. It becomes
+`wontfix` and the reason goes into its `## Comments`. Tickets that depend on it wait, since
+the blocker is not `done`.
 
-**Раннер пишет `'omp' is not on PATH`.** Агент должен запускаться из того же терминала
-командой `omp`, `claude` и т. п. Проверьте командой `run-tickets config <feature>`.
+**The runner says `'omp' is not on PATH`.** The agent must start from the same terminal as
+`omp`, `claude` and so on. Check with `run-tickets config <feature>`.
 
-**В worktree не проходят тесты.** В новом worktree нет неотслеживаемых файлов: `.env`,
-`node_modules`, `.venv`. Добавьте их установку в `worktree_setup`.
+**Tests fail in the worktree.** A new worktree has no untracked files: `.env`,
+`node_modules`, `.venv`. Bring them in with `worktree_setup`.
 
-**Тесты идут в Docker-контейнере, смонтированном на основную рабочую копию.** Тогда не
-включайте `worktree`: контейнер видит код вашей копии, а не worktree, и тесты проверяют не то.
-Работайте в ветке в основной копии (`branch = "feat/{{feature}}"`, `worktree = false`).
+**My tests run in a Docker container that mounts my checkout.** Then don't turn on
+`worktree`: the container sees your checkout's code, not the worktree's. Work on a branch in
+your checkout (`branch = "feat/{{feature}}"`, `worktree = false`).
 
-**Windows и `claude.cmd`, `pi.cmd`.** `cmd.exe` не передаёт многострочные аргументы. Поэтому
-раннер сам разворачивает npm-обёртку в `node <script>`. Если обёртка нестандартная, задайте
+**Windows and `claude.cmd`, `pi.cmd`.** `cmd.exe` cannot pass a multi-line argument, so the
+runner unwraps npm shims into `node <script>`. For an unusual shim, set
 `prompt_via = "stdin"`.
 
-**Безопасно ли это?** Агент работает без подтверждений и без песочницы. Промпт запрещает
-`git stash`, `reset --hard`, `clean`, `rebase` и `push`. Раннер замечает последствия таких
-действий, но не предотвращает их. `worktree = true` уводит работу из вашей рабочей копии.
-Полную изоляцию даёт только запуск в контейнере.
+**Is this safe?** The agent runs without approval prompts and without a sandbox. The prompt
+forbids `git stash`, `reset --hard`, `clean`, `rebase` and `push`; the runner notices the
+consequences of such commands but does not prevent them. `worktree = true` moves the work
+out of your checkout. Only a container gives full isolation.
 
-**Ограничения:**
-- review смотрит диапазон `since <база>` и захватит посторонние коммиты, если они появятся в
-  ветке между шагами;
-- стоимость сообщает только `claude`, у остальных агентов `max_cost` не работает;
-- тикеты из одной фичи выполняются строго по одному, параллельного режима нет.
+**Limitations:**
+- a review looks at `since <base>`, so commits that land on the branch between steps would be
+  included;
+- only `claude` reports cost, so `max_cost` does not apply to the other agents;
+- tickets of one feature run strictly one at a time; there is no parallel mode.
 
-## Разработка
+## Development
 
 ```bash
 python -m pip install pytest
 python -m pytest
 ```
 
-Вместо модели в тестах работает заглушка `tests/stub_agent.py`. Тесты покрывают:
-- порядок тикетов по блокерам;
-- каждую проверку и повторы;
-- тесты, которые запускает раннер, и базовую проверку перед тикетом;
-- ожидание лимитов провайдера;
-- worktree и ветку: работа остаётся локальной, папка worktree удаляется в конце;
-- финальное ревью;
-- `retry`, `reset` и `skip`;
-- разных агентов на разные шаги;
-- бюджет и защищённые пути;
-- паузу;
-- чистку логов;
-- очередь фич;
-- возобновление после настоящего `kill -9`;
-- stale lock.
+The tests run the real runner against a stub agent (`tests/stub_agent.py`). They cover:
+- ticket order by blockers;
+- every check and the retries;
+- the runner's own test runs and the baseline before a ticket;
+- waiting out provider limits;
+- worktree and branch: the work stays local, the worktree folder goes at the end;
+- the verify step, report tickets and tickets created by the agent;
+- the final review;
+- `retry`, `reset`, `skip` and `adopt`;
+- different agents per step;
+- budget and protected paths;
+- pause;
+- log cleanup;
+- a queue of features;
+- resuming after a real `kill -9`;
+- stale locks;
+- the demo in `examples/`.
 
-CI (`.github/workflows/test.yml`) гоняет тесты на Linux, macOS и Windows с Python 3.9 и 3.13.
+CI (`.github/workflows/test.yml`) runs them on Linux, macOS and Windows with Python 3.9 and
+3.13.
+
+The GIF at the top is recorded from a real run of the demo: `python examples/record_demo.py`
+(needs Pillow).
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+
+## License
+
+[MIT](LICENSE).

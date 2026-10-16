@@ -4,11 +4,27 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "run-tickets"
-version = "0.2.0"
-description = "Runs a feature's tickets one by one with a coding agent (omp, pi, Claude Code, Codex): implement, review, verify, resume after a crash."
+version = "0.3.0"
+description = "Run a feature's tickets overnight with a coding agent (Claude Code, Codex, omp, pi): one ticket at a time, a fresh agent per step, every step checked by the runner, resumes after a crash."
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.9"
 dependencies = ['tomli>=1.1; python_version < "3.11"']
+keywords = ["ai-agents", "coding-agent", "claude-code", "codex", "automation", "tickets", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/omanei/run-tickets"
+Changelog = "https://github.com/omanei/run-tickets/blob/master/CHANGELOG.md"
+Issues = "https://github.com/omanei/run-tickets/issues"
 
 [project.scripts]
 run-tickets = "run_tickets:main"
