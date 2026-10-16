@@ -229,7 +229,6 @@ def test_model_is_passed(basic):
 
 
 @pytest.mark.parametrize("key,action,reason", [
-    ("01-first:implement", "noop", "no commit was made"),
     ("01-first:implement", "dirty", "uncommitted changes were left"),
     ("01-first:implement", "exit1", "the agent exited with 1"),
     ("01-first:review", "unticked", "2 acceptance criteria are not ticked"),
@@ -244,12 +243,12 @@ def test_failed_check_stops(basic, key, action, reason):
 
 
 def test_retry_then_success(basic):
-    basic.set_plan({"01-first:implement": ["noop", "ok"]})
+    basic.set_plan({"01-first:implement": ["exit1", "ok"]})
     assert basic.run("--once", "--retries", "1") == 0
     assert basic.keys() == ["01-first:implement", "01-first:implement", "01-first:review"]
     second = basic.calls_list()[1]["prompt"]
-    assert "failed the runner's check: no commit was made" in second
-    assert "FAILED, retrying (1/1) - no commit was made" in basic.report()
+    assert "failed the runner's check: the agent exited with 1" in second
+    assert "FAILED, retrying (1/1) - the agent exited with 1" in basic.report()
 
 
 def test_stash_change_is_never_retried(basic):
@@ -773,3 +772,47 @@ def test_status_shows_the_running_step(basic, capsys):
 def test_unknown_config_key_is_an_error(basic):
     basic.write_config(retrys=3)
     assert basic.run() == rt.EXIT_USAGE
+
+
+# --- tickets without commits: the verify step --------------------------------
+
+
+def test_implement_without_commits_is_verified_not_reviewed(basic):
+    basic.set_plan({"01-first:implement": ["noop"]})
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:implement", "01-first:verify"]
+    verify = basic.calls_list()[1]["prompt"]
+    assert verify.startswith(f"Verify the ticket {basic.feature / 'issues' / '01-first.md'}. "
+                             f"Its implement step made no commits")
+    assert "The implement step's word is not evidence." in verify
+    assert basic.status("01-first") == "done"
+    report = basic.report()
+    assert "01-first - implement: ok - no commits, the verify step checks the result" in report
+    assert "01-first - verify: ok - ticket done" in report
+
+
+def test_verify_is_checked_like_a_review_and_resumes(basic):
+    basic.set_plan({"01-first:implement": ["noop"], "01-first:verify": ["unticked", "ok"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    assert "01-first - verify: STOPPED - 2 acceptance criteria are not ticked" in basic.report()
+    assert basic.state()["01-first"]["phase"] == "verify"
+    assert rt.main(["retry", str(basic.feature), "01"]) == 0
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:implement", "01-first:verify", "01-first:verify"]
+
+
+def test_report_ticket_is_verified_even_with_commits(basic):
+    p = basic.feature / "issues" / "01-first.md"
+    p.write_text(p.read_text().replace("**Status:**", "**Kind:** report\n\n**Status:**"))
+    assert rt.Ticket(p).kind() == "report"
+    assert basic.run("--once") == 0
+    assert basic.keys() == ["01-first:implement", "01-first:verify"]
+    assert "This is a report ticket (Kind: report)" in basic.calls_list()[0]["prompt"]
+    assert "(it is a report ticket)" in basic.calls_list()[1]["prompt"]
+
+
+def test_verify_step_takes_the_review_agent_settings(basic):
+    basic.write_config(tables='[steps.review]\nmodel = "reviewer"\n')
+    basic.set_plan({"01-first:implement": ["noop"]})
+    assert basic.run("--once") == 0
+    assert [c["model"] for c in basic.calls_list()] == [None, "reviewer"]
