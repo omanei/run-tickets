@@ -974,7 +974,9 @@ agent = "{{init_agent}}"           # omp | pi | claude | codex, or a name under 
 # worktree = false          # true: work in a separate git worktree on that branch, so
 #                           # your own checkout stays untouched (and usable) all night;
 #                           # when every ticket is done the worktree folder is removed and
-#                           # the branch stays in the repository
+#                           # the branch stays in the repository. Not for projects whose
+#                           # tests run in a container that mounts your main checkout:
+#                           # those tests would see your checkout's code, not the worktree's
 # worktree_dir = "{{repo}}/../{{repo_name}}-worktrees/{{feature}}"
 # worktree_setup = []       # shell commands run once in a new worktree, which has only
 #                           # tracked files; $RUN_TICKETS_MAIN_REPO is your checkout, e.g.
