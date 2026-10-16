@@ -69,9 +69,14 @@ EXIT_INTERRUPTED = 130
 # Statuses of the local tracker. "done" is the only one the runner treats as finished.
 RUNNABLE = "ready-for-agent"
 DONE = "done"
+NEW_TICKET_STATUS = "needs-triage"  # tickets an agent creates during a run wait for a human
 CLOSED = {"done", "wontfix"}
 
-STEPS = ("implement", "review", "final")
+STEPS = ("implement", "review", "verify", "final")
+# Phases of a ticket the runner is in the middle of. After implement comes review, or verify
+# when there is no diff to review (the implement step made no commits, or the ticket is a
+# report): a report, a test-bench run or new tickets live outside git.
+TICKET_PHASES = ("implement", "review", "verify")
 FINAL = "final-review"  # the state entry of the feature-wide final review
 
 CONFIG_NAMES = (".ticket-runner.toml",)
@@ -178,6 +183,7 @@ COMMON_PROMPT = """You run unattended: nobody will answer questions. Decide by t
 If you cannot finish, set the ticket's status line to `**Status:** needs-info`, append the reason under a `## Comments` heading at the end of the ticket file, and stop.
 End your final answer with a section headed `## {{report_heading}}`, written in {{report_language}}, for whoever reads the run in the morning: what you did (commit hashes), which checks you ran and their results, what is left or failed, and - if you stopped early or left anything uncommitted - exactly why.
 {{git_rules}}
+{{new_tickets_rule}}
 {{extra_instructions}}"""
 
 GIT_RULES = """Never run git stash, git reset --hard, git clean, git rebase, git commit --amend, git push, git checkout of another branch, or git checkout/restore of files you did not change: the working tree, the branch and the stash list hold the user's own work. To test the code without your changes, use git worktree add in a temporary directory and remove it afterwards.
@@ -187,7 +193,8 @@ IMPLEMENT_PROMPT = """{{implement_command}}
 
 {{common}}
 Skip the code review at the end: a separate step reviews this ticket after you. Do not change the ticket's status line and do not tick its checkboxes; the review step does that.
-Commit all your work to the current branch.
+Commit all your work to the current branch. A ticket whose result is not code (a report, a test-bench run, new tickets) may end with no commit; a separate step then checks its result.
+{{kind_note}}
 {{resume_note}}"""
 
 REVIEW_PROMPT = """{{review_command}}
@@ -202,6 +209,17 @@ After the review, without asking:
 {{review_extra_instructions}}
 {{resume_note}}"""
 
+VERIFY_PROMPT = """Verify the ticket {{ticket}}. Its implement step made no commits{{verify_reason}}, so there is no diff to review: its result, if any, is in files outside git, in the files the ticket names, and in the ticket itself.
+
+{{common}}
+Without asking:
+1. Read the ticket, its `## Comments` and every file it names.
+2. Check each `- [ ]` acceptance criterion against what actually exists: the files, their contents, results you can re-check yourself. The implement step's word is not evidence.
+3. Tick a criterion (`- [x]`) only when it is really met. Finish what is missing if you can, and commit code if you change any.
+4. When every criterion is ticked, set the ticket's status line to `**Status:** done`; otherwise follow the instruction above for unfinished work.
+{{review_extra_instructions}}
+{{resume_note}}"""
+
 FINAL_PROMPT = """{{final_command}}
 
 This is the final review of the whole feature. Its tickets ({{tickets}}) were implemented and reviewed one at a time, each by a fresh agent, so nobody has yet looked at them together. Review the change since {{base}} as a whole against the spec ({{spec}}): behaviour the spec asks for that no ticket covered, gaps and mismatches between tickets, duplicated or inconsistent code, missing wiring, dead code left by earlier tickets.
@@ -213,6 +231,7 @@ Without asking:
 4. If something cannot be fixed here, say what and why in your report.
 End your final answer with a section headed `## {{report_heading}}`, written in {{report_language}}: what you found, what you fixed (commit hashes), which checks you ran and their results, and what is left.
 {{git_rules}}
+{{new_tickets_rule}}
 {{final_review_extra_instructions}}
 {{resume_note}}"""
 
@@ -361,6 +380,8 @@ def parse_limit_wait(text: str, default: int, at: Optional[dt.datetime] = None) 
 # "**Status:** done", "**Status**: done", "Status: done", "- Status: done".
 STATUS_RE = re.compile(r"^\s*(?:[-*]\s+)?\**\s*status\s*(?::\s*\**|\**\s*:)\s*\**\s*([a-z][a-z_-]*)",
                        re.IGNORECASE)
+KIND_RE = re.compile(r"^\s*(?:[-*]\s+)?\**\s*kind\s*(?::\s*\**|\**\s*:)\s*\**\s*([a-z][a-z_-]*)",
+                     re.IGNORECASE)
 BLOCKED_RE = re.compile(r"^\s*(?:[-*]\s+)?\**\s*blocked[ -]by\s*(?::\s*\**|\**\s*:)\s*(.*)$",
                         re.IGNORECASE)
 NO_BLOCKERS_RE = re.compile(r"^\W*(none|no blockers?|nothing|n/?a)\b|^\W*$", re.IGNORECASE)
@@ -387,6 +408,14 @@ class Ticket:
     def status(self) -> str:
         for line in self.text().splitlines():
             m = STATUS_RE.match(line)
+            if m:
+                return m.group(1).lower()
+        return ""
+
+    def kind(self) -> str:
+        """`**Kind:** report` marks a ticket whose result is not code."""
+        for line in self.text().splitlines():
+            m = KIND_RE.match(line)
             if m:
                 return m.group(1).lower()
         return ""
@@ -469,6 +498,9 @@ class FinalUnit:
         self.number = 10 ** 6
 
     def status(self) -> str:
+        return ""
+
+    def kind(self) -> str:
         return ""
 
 
@@ -755,7 +787,7 @@ class State:
     """runs/state.json, rewritten atomically on every change.
 
     tickets.<name> (and tickets.final-review for the final review):
-      phase      implement | review | final | done
+      phase      implement | review | verify | final | done
       running    true while an agent process for `phase` may be alive
       base       HEAD before the ticket's first implement attempt (kept across attempts)
       step_head  HEAD before the running step
@@ -888,6 +920,8 @@ def build_config(path: Optional[Path], args: argparse.Namespace) -> Dict[str, An
     cfg["step"] = {}
     for step in STEPS:
         over = cfg["steps"].get(step, {})
+        if step == "verify":  # the review-like step for tickets without a diff
+            over = {**cfg["steps"].get("review", {}), **over}
         name = over.get("agent", cfg["agent"])
         max_time = over.get("max_time", cfg["max_time"])
         cfg["step"][step] = {"agent": name, "model": over.get("model", cfg["model"]),
@@ -940,7 +974,9 @@ agent = "{{init_agent}}"           # omp | pi | claude | codex, or a name under 
 # worktree = false          # true: work in a separate git worktree on that branch, so
 #                           # your own checkout stays untouched (and usable) all night;
 #                           # when every ticket is done the worktree folder is removed and
-#                           # the branch stays in the repository
+#                           # the branch stays in the repository. Not for projects whose
+#                           # tests run in a container that mounts your main checkout:
+#                           # those tests would see your checkout's code, not the worktree's
 # worktree_dir = "{{repo}}/../{{repo_name}}-worktrees/{{feature}}"
 # worktree_setup = []       # shell commands run once in a new worktree, which has only
 #                           # tracked files; $RUN_TICKETS_MAIN_REPO is your checkout, e.g.
@@ -984,7 +1020,8 @@ agent = "{{init_agent}}"           # omp | pi | claude | codex, or a name under 
 # implement = "implement"
 # review = "code-review"
 
-# Another agent, model or time limit for one step (implement, review, final):
+# Another agent, model or time limit for one step (implement, review, verify, final;
+# verify, the check of a ticket without commits, takes review's settings unless set):
 # [steps.review]
 # agent = "codex"
 # model = ""
@@ -1429,6 +1466,14 @@ class Runner:
             "review_extra_instructions": self.cfg.get("review_extra_instructions", ""),
             "final_review_extra_instructions": self.cfg.get("final_review_extra_instructions", ""),
             "resume_note": resume_note,
+            "new_tickets_rule": (f"If you create new tickets in {self.feature.issues}, give each one the "
+                                 f"status line `**Status:** {NEW_TICKET_STATUS}`: the runner does not "
+                                 f"pick such tickets up, a human triages them first."),
+            "kind_note": ("This is a report ticket (Kind: report): its result is the report and "
+                          "the files the ticket names, not code; commit only code you change."
+                          if unit.kind() == "report" else ""),
+            "verify_reason": (" (it is a report ticket)" if unit.kind() == "report"
+                              and self.git.head() != base else ""),
             "implement_command": self.skill_command(step, "implement", str(unit.path)),
             "review_command": self.skill_command(step, "review", f"since {base} for the ticket {unit.path}"),
             "final_command": self.skill_command(
@@ -1437,7 +1482,8 @@ class Runner:
         values["git_rules"] = fill(GIT_RULES, {"test_rule": test_rule})
         prompts = self.cfg.get("prompts") or {}
         values["common"] = fill(prompts.get("common", COMMON_PROMPT), values).strip()
-        default = {"implement": IMPLEMENT_PROMPT, "review": REVIEW_PROMPT, "final": FINAL_PROMPT}[step]
+        default = {"implement": IMPLEMENT_PROMPT, "review": REVIEW_PROMPT, "verify": VERIFY_PROMPT,
+                   "final": FINAL_PROMPT}[step]
         text = fill(prompts.get(step, default), values)
         return re.sub(r"\n{3,}", "\n\n", text).strip() + "\n"
 
@@ -1636,9 +1682,8 @@ class Runner:
             status = unit.status()
             if status != RUNNABLE:
                 return f"the ticket status is now '{status or 'missing'}'", False
-            if self.git.head() == entry["base"]:
-                return "no commit was made", True
-        elif step == "review":
+            # No commit is not a failure: the verify step checks a result outside git.
+        elif step in ("review", "verify"):
             status = unit.status()
             if status != DONE:
                 # ready-for-agent: the agent did not finish; anything else: it asked for a human.
@@ -1701,6 +1746,10 @@ class Runner:
         self.rotate_logs()
         if self.state.data.get("waiting"):
             self.state.set(waiting=None)
+        for name, entry in list(self.state.data["tickets"].items()):
+            if entry.get("tickets_before") is not None:  # a step cut off before its triage
+                unit = FinalUnit(self.feature) if name == FINAL else Ticket(self.feature.issues / f"{name}.md")
+                self.triage_new_tickets(unit, entry)
         recovered = self.recover_finished_step()
         if recovered is not None:
             return recovered
@@ -1708,7 +1757,7 @@ class Runner:
         dirty = self.git.tracked_changes(self.exclude)
         if dirty:
             pending = [n for n, e in self.state.data["tickets"].items()
-                       if e.get("phase") in ("implement", "review", "final")
+                       if e.get("phase") in TICKET_PHASES + ("final",)
                        and (e.get("running") or e.get("last_stop"))]
             if not (pending and self.opts.adopt_dirty):
                 warn(f"the working tree {self.git.repo} has uncommitted changes; commit or stash them first:")
@@ -1747,26 +1796,27 @@ class Runner:
             ticket = Ticket(path)
             if ticket.status() == RUNNABLE:
                 continue  # resumed by the loop
-            step = "review" if entry.get("phase") == "review" else "implement"
+            step = entry.get("phase") if entry.get("phase") in TICKET_PHASES else "implement"
             say(f"==> {name}: the runner stopped during its {step} step; checking it now")
             failed = self.check_step(step, ticket, entry, None)
             if failed:
                 return self.stop(ticket, step, f"{failed[0]} (checked after an interrupted run)",
                                  None, entry.get("base", ""))
-            if step == "review":
+            if step != "implement":
                 self.state.update(name, phase="done", running=False, last_stop=None, finished=iso())
-                self.record(ticket, "review", "ok - ticket done (checked after an interrupted run)",
+                self.record(ticket, step, "ok - ticket done (checked after an interrupted run)",
                             None, entry["base"])
             else:
-                self.state.update(name, phase="review", running=False)
+                nxt = "verify" if ticket.kind() == "report" or self.git.head() == entry["base"] else "review"
+                self.state.update(name, phase=nxt, running=False)
         return None
 
     def run_ticket(self, ticket: Ticket) -> int:
         entry = self.state.ticket(ticket.name)
-        resuming = (entry.get("phase") in ("implement", "review") and entry.get("base")
+        resuming = (entry.get("phase") in TICKET_PHASES and entry.get("base")
                     and self.git.is_ancestor(entry["base"]))
         if not resuming:
-            if entry.get("phase") in ("implement", "review"):
+            if entry.get("phase") in TICKET_PHASES:
                 say(f"==> {ticket.name}: earlier base {str(entry.get('base'))[:10]} is not in "
                     f"HEAD's history any more; starting the ticket over")
             entry.clear()
@@ -1777,12 +1827,14 @@ class Runner:
             fb = self.state.data.get("feature_base")
             if not fb or not self.git.is_ancestor(fb):
                 self.state.set(feature_base=head)
-        elif entry.get("branch") != self.git.branch():
+        elif entry.get("branch") and entry["branch"] != self.git.branch():
             return self.stop(ticket, entry["phase"],
                              f"the ticket was started on branch {entry.get('branch')}, "
                              f"now on {self.git.branch()}; switch back or run "
                              f"`run-tickets reset {self.feature.dir} {ticket.number:02d}`")
         else:
+            if not entry.get("branch"):  # adopted: it runs on whatever branch the run uses
+                self.state.update(ticket.name, branch=self.git.branch())
             say(f"==> {ticket.name}: resuming at {entry['phase']} (base {entry['base'][:10]})")
 
         pre = self.preflight(ticket.name)
@@ -1799,12 +1851,16 @@ class Runner:
             self.last_tests = None
 
         started = time.monotonic()
-        for step in ("implement", "review"):
-            if step == "implement" and entry["phase"] != "implement":
-                continue
-            code = self.run_step(ticket, step)
+        if entry["phase"] == "implement":
+            code = self.run_step(ticket, "implement")
             if code != EXIT_OK:
                 return code
+        if entry["phase"] == "review" and self.git.head() == entry["base"]:
+            # Nothing to review (an adopted or older state): check the result instead.
+            self.state.update(ticket.name, phase="verify")
+        code = self.run_step(ticket, entry["phase"])
+        if code != EXIT_OK:
+            return code
         commits = len(self.git.commits(entry["base"]))
         self.state.update(ticket.name, commits=commits)
         self.done_this_run.append((ticket.name, time.monotonic() - started, commits))
@@ -1838,9 +1894,11 @@ class Runner:
             prompt = self.build_prompt(step, unit, entry["base"], note)
             self.state.update(unit.name, phase=step, running=True, stash=self.git.stash(),
                               branch=self.git.branch(), step_head=self.git.head(),
-                              attempt=attempt + 1)
+                              attempt=attempt + 1,
+                              tickets_before=[t.name for t in self.feature.tickets()])
             run = self.run_agent(unit, step, prompt, attempt + 1)
             self.account(unit, run)
+            self.triage_new_tickets(unit, entry)
             failed = self.check_step(step, unit, entry, run)
             if failed is None:
                 return self.step_passed(unit, step, run, entry)
@@ -1878,12 +1936,39 @@ class Runner:
             time.sleep(self.cfg["retry_delay_seconds"])
             note = self.retry_note(step, reason, run)
 
+    def triage_new_tickets(self, unit: Any, entry: Dict[str, Any]) -> None:
+        """Tickets the agent created during the step wait for a human: the runner sets them
+        to needs-triage whatever status the agent gave them, so they are never picked up."""
+        before = entry.get("tickets_before")
+        if before is None:
+            return
+        new = [t for t in self.feature.tickets() if t.name not in set(before)]
+        entry.pop("tickets_before", None)
+        self.state.save()
+        if not new:
+            return
+        changed = []
+        for t in new:
+            if t.status() != NEW_TICKET_STATUS:
+                changed.append(f"{t.name} ({t.status() or 'no status'})")
+                t.set_status(NEW_TICKET_STATUS)
+        names = ", ".join(t.name for t in new)
+        say(f"==> {unit.name}: new ticket(s) from the agent, left for triage: {names}")
+        self.event("new_tickets", ticket=unit.name, new=[t.name for t in new], changed=changed)
+        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} {unit.name} - new tickets: {names}\n\n"
+                       f"The agent created them; they are {NEW_TICKET_STATUS} and wait for a human."
+                       + (f" Set to {NEW_TICKET_STATUS} by the runner: {', '.join(changed)}." if changed else "")
+                       + "\n\n")
+
     def step_passed(self, unit: Any, step: str, run: StepRun, entry: Dict[str, Any]) -> int:
         if step == "implement":
-            self.state.update(unit.name, phase="review", running=False, last_stop=None,
+            nxt = "verify" if unit.kind() == "report" or self.git.head() == entry["base"] else "review"
+            self.state.update(unit.name, phase=nxt, running=False, last_stop=None,
                               implemented=self.git.head())
-            self.record(unit, step, "ok", run, entry["base"])
-        elif step == "review":
+            self.record(unit, step, "ok" if nxt == "review" else
+                        "ok - no commits" + (" (report ticket)" if unit.kind() == "report" else "")
+                        + ", the verify step checks the result", run, entry["base"])
+        elif step in ("review", "verify"):
             self.state.update(unit.name, phase="done", running=False, last_stop=None,
                               finished=iso())
             self.record(unit, step, "ok - ticket done", run, entry["base"])
@@ -1902,7 +1987,7 @@ class Runner:
             lead = f"A previous {step} run of {what} was stopped by the runner: {stop.get('reason')}."
         else:
             return ""
-        if step != "review" and self.git.head() != entry.get("step_head", entry["base"]):
+        if step in ("implement", "final") and self.git.head() != entry.get("step_head", entry["base"]):
             lead += (f" Commits since {entry['base'][:10]} may hold its partial work: read them "
                      f"and continue from there instead of starting over.")
         if self.git.tracked_changes(self.exclude):
@@ -2138,7 +2223,7 @@ def status_text(feature: Feature) -> List[str]:
             if why:
                 line += f", waiting on {', '.join(why)}"
         entry = data["tickets"].get(t.name) or {}
-        if entry.get("phase") in ("implement", "review"):
+        if entry.get("phase") in TICKET_PHASES:
             line += f"\n        runner: at {entry['phase']}" + (" (interrupted)" if entry.get("running") and not running else "")
             if entry.get("last_stop"):
                 line += f", stopped {entry['last_stop'].get('time')}: {entry['last_stop'].get('reason', '').splitlines()[0]}"
@@ -2250,7 +2335,7 @@ def cmd_config(feature: Feature, args: argparse.Namespace) -> int:
         else:
             runner = Runner(feature, git, cfg, args)
             base = git.head()
-            for step in ("implement", "review"):
+            for step in ("implement", "review", "verify"):
                 say(f"\n----- {step} prompt for {ticket.name} -----")
                 say(runner.build_prompt(step, ticket, base, ""))
             if cfg["final_review"]:
@@ -2276,7 +2361,7 @@ def cmd_ticket(feature: Feature, action: str, ref: str, reason: str) -> int:
         ticket = feature.find(ref)
         entry = state.data["tickets"].get(ticket.name)
         if action == "retry":
-            pending = bool(entry) and entry.get("phase") in ("implement", "review")
+            pending = bool(entry) and entry.get("phase") in TICKET_PHASES
             if ticket.status() == DONE and not pending:
                 raise UsageError(f"{ticket.name} is done; use `reset` to do it again")
             if ticket.status() != RUNNABLE:
@@ -2285,7 +2370,7 @@ def cmd_ticket(feature: Feature, action: str, ref: str, reason: str) -> int:
                 entry.pop("last_stop", None)
                 entry.pop("paused", None)
                 state.save()
-            where = entry.get("phase") if entry and entry.get("phase") in ("implement", "review") else "implement"
+            where = entry.get("phase") if entry and entry.get("phase") in TICKET_PHASES else "implement"
             say(f"{ticket.name}: ready-for-agent; the next run resumes it at {where}")
         elif action == "reset":
             state.data["tickets"].pop(ticket.name, None)
@@ -2307,6 +2392,62 @@ def cmd_ticket(feature: Feature, action: str, ref: str, reason: str) -> int:
         lock.release()
 
 
+def cmd_adopt(feature: Feature, feature_base: Optional[str], resume: List[str]) -> int:
+    """Takes over a feature another runner (or a person) started: the final review's base,
+    and tickets to continue at a given step from a given base commit."""
+    if not feature_base and not resume:
+        raise UsageError("adopt needs --feature-base and/or --resume NN:PHASE:COMMIT")
+    git = Git(feature.dir)
+    lock = Lock(feature.runs / ".lock", feature.dir)
+    lock.acquire()
+    try:
+        state = State(feature.runs / "state.json")
+        branch = (state.data.get("git") or {}).get("branch") or "HEAD"
+
+        def commit(rev: str, what: str) -> str:
+            r = git.run("rev-parse", "--verify", "-q", f"{rev}^{{commit}}")
+            if r.returncode != 0:
+                raise UsageError(f"{what}: '{rev}' is not a commit in {git.repo}")
+            sha = r.stdout.strip()
+            if not git.is_ancestor(sha, branch):
+                warn(f"warning: {what} {sha[:10]} is not in the history of {branch}; a run "
+                     f"ignores a base that is not, and starts that ticket (or the final "
+                     f"review's range) from the current HEAD")
+            return sha
+
+        plans = []
+        for item in resume:
+            parts = item.split(":")
+            if len(parts) != 3 or parts[1] not in TICKET_PHASES:
+                raise UsageError(f"--resume '{item}': use NN:PHASE:COMMIT, PHASE one of "
+                                 f"{', '.join(TICKET_PHASES)}")
+            ticket = feature.find(parts[0])
+            if ticket.status() == DONE:
+                raise UsageError(f"{ticket.name} is done; `run-tickets reset` it first to do it again")
+            plans.append((ticket, parts[1], commit(parts[2], f"--resume {ticket.name}")))
+        base = commit(feature_base, "--feature-base") if feature_base else ""
+
+        if base:
+            state.data["feature_base"] = base
+            say(f"feature base: {base[:10]} (the final review looks at everything since it)")
+        for ticket, phase, sha in plans:
+            state.data["tickets"][ticket.name] = {
+                "phase": phase, "base": sha, "running": False, "started": iso(),
+                "adopted": iso(), "updated": iso()}
+            if ticket.status() != RUNNABLE:
+                say(f"{ticket.name}: status {ticket.status() or 'missing'} -> {RUNNABLE}")
+                ticket.set_status(RUNNABLE)
+            say(f"{ticket.name}: the next run continues it at {phase} with base {sha[:10]}"
+                + (" (no commits since: verify instead of review)"
+                   if phase == "review" and git.is_ancestor(sha, branch)
+                   and git.out("rev-parse", branch) == sha else ""))
+        state.save()
+        say(f"run: run-tickets run {feature.dir}")
+        return EXIT_OK
+    finally:
+        lock.release()
+
+
 HELP_EPILOG = """examples:
   run-tickets init --agent claude            # .ticket-runner.toml in the repo root
   run-tickets config .scratch/my-feature      # what will run, with which settings
@@ -2317,6 +2458,7 @@ HELP_EPILOG = """examples:
   run-tickets retry  .scratch/my-feature 05   # rerun the step 05 stopped at
   run-tickets reset  .scratch/my-feature 05   # do 05 again from scratch
   run-tickets skip   .scratch/my-feature 05 --reason "covered by 06"
+  run-tickets adopt  .scratch/my-feature --feature-base abc123 --resume 16:review:def456
 
 The feature dir can be given from anywhere; the runner works in the git repo that
 contains it. Config: --config, else .ticket-runner.toml in the feature dir, else in
@@ -2325,7 +2467,7 @@ exit codes: 0 all done, 1 stopped, 2 usage/setup error, 3 open tickets left,
 4 paused, 130 interrupted
 """
 
-COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip")
+COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip", "adopt")
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -2382,6 +2524,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         t.add_argument("feature")
         t.add_argument("ticket", help="number (05), name (05-slug), or 'final' for the final review")
         t.add_argument("--reason", default="", help="why (written to the ticket's Comments)")
+
+    a = sub.add_parser("adopt", help="take over a feature another runner started")
+    a.add_argument("feature")
+    a.add_argument("--feature-base", dest="feature_base", metavar="COMMIT",
+                   help="the commit before the feature's first ticket (the final review's base)")
+    a.add_argument("--resume", action="append", default=[], metavar="NN:PHASE:COMMIT",
+                   help="continue ticket NN at PHASE (implement, review, verify) with base "
+                        "COMMIT, the commit before its implement step (repeatable)")
 
     i = sub.add_parser("init", help="write an example .ticket-runner.toml")
     i.add_argument("dir", nargs="?", help="where to write it (default: the repo root)")
@@ -2466,6 +2616,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_status(Feature(Path(args.feature)), args.watch)
         if args.command == "config":
             return cmd_config(Feature(Path(args.feature)), args)
+        if args.command == "adopt":
+            return cmd_adopt(Feature(Path(args.feature)), args.feature_base, args.resume)
         if args.command in ("retry", "reset", "skip"):
             return cmd_ticket(Feature(Path(args.feature)), args.command, args.ticket, args.reason)
         if args.dry_run:

@@ -2,7 +2,8 @@
 
 Called as: stub_agent.py [--model M] --session-dir DIR --cwd REPO [PROMPT]
 (the prompt comes from stdin when it is not an argument). The step comes from the
-prompt's first line: /skill:implement, /skill:code-review ... for the ticket, or
+prompt's first line: /skill:implement, /skill:code-review ... for the ticket,
+"Verify the ticket ..." (the verify step of a ticket without commits), or
 /skill:code-review ... for the whole feature (the final review). What the stub does is
 set by $STUB_PLAN, a JSON file {"<ticket>:<step>": ["action of call 1", ...]} (the
 final review's key is "final:final"); the default action is "ok". Every call is
@@ -51,7 +52,8 @@ def main():
     if "for the whole feature" in first:
         step, ticket, key = "final", None, "final:final"
     else:
-        step = "implement" if first.split()[0].endswith("implement") else "review"
+        word = first.split()[0]
+        step = "implement" if word.endswith("implement") else "verify" if word == "Verify" else "review"
         ticket = Path(re.search(r"(\S+\.md)", first).group(1))
         key = f"{ticket.stem}:{step}"
 
@@ -88,6 +90,11 @@ def main():
     elif action == "fix-tests":
         git(cwd, "rm", "-q", "BROKEN")
         git(cwd, "commit", "-qm", "fix the tests")
+    elif action == "new-ticket":
+        commit_file(cwd, "code.txt", "found more work\n", f"implement {name}")
+        Path(ticket.parent, "05-follow-up.md").write_text(
+            "# 05: Follow-up\n\n**Blocked by:** None\n\n**Status:** ready-for-agent\n\n- [ ] more\n",
+            encoding="utf-8")
     elif action == "protected":
         commit_file(cwd, "migrations/001.sql", "drop table users;\n", "touch a migration")
     elif action == "threshold":
