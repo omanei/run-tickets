@@ -1,8 +1,10 @@
 name: release
 
-# Push a tag with the bare version (0.5.0) to publish it to PyPI and create the GitHub
-# Release. Run by hand (Actions -> release -> Run workflow) to publish the current code to
-# TestPyPI as a dry run. Publishing uses PyPI trusted publishing: no token in the repository.
+# A tag with the bare version (0.5.0) publishes it to PyPI and makes the GitHub Release.
+# The tag can be pushed from git, or made by publishing a release in the web UI
+# (Releases -> Draft a new release -> new tag 0.5.0 on master); either way works.
+# Run by hand (Actions -> release -> Run workflow) to publish the current code to TestPyPI
+# as a dry run. Publishing uses PyPI trusted publishing: no token in the repository.
 
 on:
   push:
@@ -78,8 +80,23 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: notes
-      - run: >
-          gh release create "$GITHUB_REF_NAME" dist/*
-          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --notes-file notes.md
+      # A tag pushed from git has no release yet: create it. A release published in the web
+      # UI (which made the tag) is filled in instead: the changelog notes when its
+      # description was left empty, the title when it has none, and the built files.
+      - name: Create or fill in the GitHub Release
+        run: |
+          tag="$GITHUB_REF_NAME"
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" dist/* --title "$tag" --notes-file notes.md
+            exit 0
+          fi
+          if [ -z "$(gh release view "$tag" --json body --jq .body | tr -d '[:space:]')" ]; then
+            gh release edit "$tag" --notes-file notes.md
+          fi
+          if [ -z "$(gh release view "$tag" --json name --jq .name)" ]; then
+            gh release edit "$tag" --title "$tag"
+          fi
+          gh release upload "$tag" dist/* --clobber
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

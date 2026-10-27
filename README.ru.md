@@ -641,12 +641,16 @@ GIF в начале README записан с настоящего прогона
 1. В pull request: поставить новую версию в `run_tickets.py` (`__version__`) и
    `pyproject.toml`, а в `CHANGELOG.md` дать её разделу версию и дату
    (`## 0.5.0 - 2026-10-27`). Влить.
-2. Повесить на коммит слияния тег с номером версии без `v` и запушить его:
-   `git tag 0.5.0 origin/master && git push origin 0.5.0`.
+2. Повесить на коммит слияния тег с номером версии без `v`, одним из двух способов:
+   - из git: `git tag 0.5.0 origin/master && git push origin 0.5.0`;
+   - на GitHub: Releases → Draft a new release → Choose a tag → ввести `0.5.0` → Create new
+     tag on publish, target `master` → Publish release. Описание можно оставить пустым:
+     workflow заполнит его из CHANGELOG. Если написать текст самому, он останется.
 
 Дальше `.github/workflows/release.yml` проверяет, что тег, обе версии и CHANGELOG сходятся,
 гоняет тесты, собирает пакет, публикует его в PyPI и создаёт GitHub Release с разделом
-CHANGELOG в описании. Публикация идёт через trusted publishing PyPI: токенов в репозитории
+CHANGELOG в описании. Если релиз создан на GitHub, workflow дополняет его и прикрепляет к
+нему файлы пакета. Публикация идёт через trusted publishing PyPI: токенов в репозитории
 нет. Запуск workflow вручную (Actions → release → Run workflow) публикует текущий `master` в
 TestPyPI — для пробы.
 

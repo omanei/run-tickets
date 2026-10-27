@@ -661,12 +661,16 @@ See [CHANGELOG.md](https://github.com/omanei/run-tickets/blob/master/CHANGELOG.m
 1. In a pull request: set the new version in `run_tickets.py` (`__version__`) and
    `pyproject.toml`, and give its `CHANGELOG.md` section the version and date
    (`## 0.5.0 - 2026-10-27`). Merge it.
-2. Tag the merge commit with the bare version and push the tag:
-   `git tag 0.5.0 origin/master && git push origin 0.5.0`.
+2. Tag the merge commit with the bare version, in either of two ways:
+   - from git: `git tag 0.5.0 origin/master && git push origin 0.5.0`;
+   - on GitHub: Releases → Draft a new release → Choose a tag → type `0.5.0` → Create new
+     tag on publish, target `master` → Publish release. Leave the description empty and the
+     workflow fills it in from the changelog (text you write there is kept).
 
 `.github/workflows/release.yml` then checks that the tag, both versions and the changelog
 agree, runs the tests, builds the package, publishes it to PyPI and creates the GitHub
-Release with the changelog section as its notes. Publishing uses PyPI trusted publishing:
+Release with the changelog section as its notes, or fills in the release made on GitHub
+and attaches the package files to it. Publishing uses PyPI trusted publishing:
 no token is stored in the repository. Run the workflow by hand (Actions → release → Run
 workflow) to publish the current `master` to TestPyPI as a dry run.
 
