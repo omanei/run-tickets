@@ -60,7 +60,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 IS_WINDOWS = os.name == "nt"
 

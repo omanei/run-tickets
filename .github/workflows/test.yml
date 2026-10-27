@@ -22,3 +22,21 @@ jobs:
       - if: matrix.python == '3.13'
         run: python -m pip install "rich>=13"
       - run: python -m pytest -v
+
+  package:
+    # The package as users get it: built, its metadata valid for PyPI, installed in a
+    # clean environment, the command working with rich installed beside it.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist/*.whl
+          /tmp/venv/bin/run-tickets --version
+          /tmp/venv/bin/python -c "import rich"

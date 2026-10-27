@@ -44,8 +44,8 @@
 ## Быстрый старт
 
 ```bash
-# 1. Установить один раз (нужен uv: https://docs.astral.sh/uv/)
-uv tool install git+https://github.com/omanei/run-tickets
+# 1. Установить один раз (нужен uv: https://docs.astral.sh/uv/; или: pipx install run-tickets)
+uv tool install run-tickets
 
 # 2. В корне проекта создать конфиг и проверить, что получилось
 cd ~/work/my-project
@@ -71,8 +71,8 @@ git-репозиторий он находит сам по этому пути. 
 ### 1. Как команду: рекомендуется
 
 ```bash
-uv tool install git+https://github.com/omanei/run-tickets      # или:
-pipx install    git+https://github.com/omanei/run-tickets
+uv tool install run-tickets      # или:
+pipx install run-tickets
 ```
 
 | | uv | pipx |
@@ -80,14 +80,16 @@ pipx install    git+https://github.com/omanei/run-tickets
 | обновить | `uv tool upgrade run-tickets` | `pipx upgrade run-tickets` |
 | удалить | `uv tool uninstall run-tickets` | `pipx uninstall run-tickets` |
 
-- Если репозиторий приватный, используйте адрес `git+ssh://git@github.com/omanei/run-tickets`.
+- Конкретная версия: `uv tool install run-tickets==0.5.0`. Свежий, ещё не выпущенный код из
+  `master`: `uv tool install git+https://github.com/omanei/run-tickets` (или `pipx install
+  git+https://github.com/omanei/run-tickets`).
 - Если после установки команда не находится, выполните `uv tool update-shell` или
   `pipx ensurepath` и перезапустите терминал.
 
 ### 2. Без установки
 
 ```bash
-uvx --from git+https://github.com/omanei/run-tickets run-tickets run .scratch/my-feature
+uvx run-tickets run .scratch/my-feature
 ```
 
 ### 3. Одним файлом в проекте
@@ -633,6 +635,20 @@ GIF в начале README записан с настоящего прогона
 `python examples/record_demo.py` (Linux или macOS; нужны `pillow` и `pyte`).
 
 История изменений — в [CHANGELOG.md](CHANGELOG.md).
+
+### Выпуск версии
+
+1. В pull request: поставить новую версию в `run_tickets.py` (`__version__`) и
+   `pyproject.toml`, а в `CHANGELOG.md` дать её разделу версию и дату
+   (`## 0.5.0 - 2026-10-27`). Влить.
+2. Повесить на коммит слияния тег с номером версии без `v` и запушить его:
+   `git tag 0.5.0 origin/master && git push origin 0.5.0`.
+
+Дальше `.github/workflows/release.yml` проверяет, что тег, обе версии и CHANGELOG сходятся,
+гоняет тесты, собирает пакет, публикует его в PyPI и создаёт GitHub Release с разделом
+CHANGELOG в описании. Публикация идёт через trusted publishing PyPI: токенов в репозитории
+нет. Запуск workflow вручную (Actions → release → Run workflow) публикует текущий `master` в
+TestPyPI — для пробы.
 
 ## Лицензия
 
