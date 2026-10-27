@@ -22,6 +22,9 @@
 репозитории появляется ветка с коммитами, а пушить её или нет, решаете вы. Если раннер упал,
 его можно запустить снова, и он продолжит с того же шага.
 
+Зачем это нужно, если агент может сам, — подробнее и чтобы поделиться:
+[docs/why.ru.md](https://github.com/omanei/run-tickets/blob/master/docs/why.ru.md).
+
 ```
  следующий тикет ─▶ implement ─▶ проверки + тесты ─▶ review ─▶ проверки + тесты ─▶ done
         ▲              │ провал: повтор │ лимит провайдера: ждать           │
@@ -757,6 +760,10 @@ python -m pytest
 - демо из `examples/`.
 
 CI (`.github/workflows/test.yml`) гоняет тесты на Linux, macOS и Windows с Python 3.9 и 3.13.
+
+В [CONTRIBUTING.md](https://github.com/omanei/run-tickets/blob/master/CONTRIBUTING.md)
+(по-английски) — правила кода (один файл, Python 3.9, простой вывод как стабильный
+интерфейс) и шаги для добавления пресета агента.
 
 GIF в начале README записан с настоящего прогона демо в псевдотерминале:
 `python examples/record_demo.py` (Linux или macOS; нужны `pillow` и `pyte`).

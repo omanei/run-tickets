@@ -1,0 +1,68 @@
+name: Bug report
+description: The runner did something wrong, stopped when it should not have, or crashed.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks! Logs can hold paths, code and tokens from your project: look through them and
+        cut what you can't share before you paste them.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what the runner did instead.
+    validations:
+      required: true
+  - type: input
+    id: command
+    attributes:
+      label: The command
+      placeholder: run-tickets run .scratch/my-feature --branch feat/x
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: run-tickets version
+      description: "`run-tickets --version`"
+      placeholder: run-tickets 0.5.0
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent and its version
+      description: "For example `claude --version`, `codex --version`, `omp --version`."
+      placeholder: claude 2.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      options: [Linux, macOS, Windows, WSL, other]
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+  - type: textarea
+    id: config
+    attributes:
+      label: "`run-tickets config <feature dir>` output"
+      description: Which config was used, where each value comes from, the exact agent commands.
+      render: text
+  - type: textarea
+    id: report
+    attributes:
+      label: The relevant part of runs/REPORT.md
+      description: The entries of the step that went wrong. The step's log (its path is in the entry) helps too.
+      render: markdown
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: The console output, `runs/events.jsonl` lines, what you tried.

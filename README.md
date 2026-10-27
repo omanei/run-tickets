@@ -42,6 +42,9 @@ the agent that doesn't trust any of that:
   process tree, and in the morning a summary says what was done, where it stopped and why.
 - **Local only.** The result is a branch in your repository; pushing it is up to you.
 
+The longer version, to read or to share:
+[Why a runner, if the agent can do it itself](https://github.com/omanei/run-tickets/blob/master/docs/why.md).
+
 It works on **Linux, macOS and Windows** with Python 3.9+ and git. The installer brings the
 one library it uses, `rich`, for highlighted code and tables; a copied file runs without it.
 It drives **Claude Code, Codex, omp, pi, Gemini CLI, Qwen Code, opencode, Kilo, Cursor, Amp,
@@ -774,6 +777,10 @@ The tests run the real runner against a stub agent (`tests/stub_agent.py`). They
 
 CI (`.github/workflows/test.yml`) runs them on Linux, macOS and Windows with Python 3.9 and
 3.13.
+
+[CONTRIBUTING.md](https://github.com/omanei/run-tickets/blob/master/CONTRIBUTING.md) has
+the rules of the code (one file, Python 3.9, plain output as a stable interface) and the
+steps to add an agent preset.
 
 The GIF at the top is recorded from a real run of the demo in a pseudo-terminal:
 `python examples/record_demo.py` (Linux or macOS; needs `pillow` and `pyte`).

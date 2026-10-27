@@ -24,6 +24,9 @@ All notable changes to this project are listed here. The format follows
   for Node and Python, Slack and Telegram notifications, and several features in one
   run. A test loads every example and every config block in the READMEs, so they keep
   up with the runner.
+- `CONTRIBUTING.md`, issue templates (a bug report, a feature request, an agent preset)
+  and a pull request template, and `docs/why.md` (`docs/why.ru.md`): why a runner, if the
+  agent can do it itself (#16).
 - Experimental presets for more agents: `gemini` (Gemini CLI), `qwen` (Qwen Code),
   `opencode`, `kilo` (Kilo CLI), `cursor` (Cursor CLI), `amp`, `droid` (Factory),
   `copilot` (GitHub Copilot CLI) and `goose`. They are made from each tool's
