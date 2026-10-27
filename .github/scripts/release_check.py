@@ -9,6 +9,7 @@ Prints that section and how to install, for the GitHub Release.
 
 import re
 import sys
+from datetime import date
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -37,7 +38,9 @@ def check(tag: str, root: Path = ROOT) -> str:
     m = re.search(rf"^## {re.escape(tag)} - \d{{4}}-\d{{2}}-\d{{2}}[ \t]*\n(.*?)(?=^## |\Z)",
                   changelog, re.MULTILINE | re.DOTALL)
     if not m or not m.group(1).strip():
-        errors.append(f"CHANGELOG.md has no '## {tag} - YYYY-MM-DD' section with the changes")
+        errors.append(f"CHANGELOG.md has no '## {tag} - YYYY-MM-DD' section with the changes"
+                      + (f"; rename its '## Unreleased' heading to '## {tag} - {date.today()}'"
+                         if re.search(r"^## Unreleased[ \t]*$", changelog, re.MULTILINE) else ""))
     if errors:
         raise ValueError("\n".join(errors))
     return m.group(1).strip() + "\n\n" + INSTALL + "\n"  # type: ignore[union-attr]

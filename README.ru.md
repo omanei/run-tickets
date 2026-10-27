@@ -773,8 +773,9 @@ GIF в начале README записан с настоящего прогона
 ### Выпуск версии
 
 1. В pull request: поставить новую версию в `run_tickets.py` (`__version__`) и
-   `pyproject.toml`, а в `CHANGELOG.md` дать её разделу версию и дату
-   (`## 0.5.0 - 2026-10-27`). Влить.
+   `pyproject.toml`, а заголовок `## Unreleased` в `CHANGELOG.md` заменить на версию и дату
+   (`## 0.5.0 - 2026-10-27`). Влить. `python .github/scripts/release_check.py 0.5.0`
+   проверит все три места до тега.
 2. Повесить на коммит слияния тег с номером версии без `v`, одним из двух способов:
    - из git: `git tag 0.5.0 origin/master && git push origin 0.5.0`;
    - на GitHub: Releases → Draft a new release → Choose a tag → ввести `0.5.0` → Create new
