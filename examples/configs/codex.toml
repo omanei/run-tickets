@@ -1,0 +1,18 @@
+# Codex CLI. Copy to .ticket-runner.toml in your repository root.
+# Check it with: run-tickets config <feature dir>
+# The codex preset is experimental: `run-tickets config` prints its exact command, and
+# [agents.codex] fixes a flag that has changed.
+
+agent = "codex"
+# model = ""                  # passed as -m; empty: Codex's own default
+
+test_command = "make test"    # the runner runs the tests itself after every step
+branch = "feat/{{feature}}"   # the work goes to its own branch; nothing is pushed
+
+# Codex reports no cost, so max_cost and max_step_cost do not apply: max_time and
+# retries are what bound a run.
+max_time = "2h"               # per step
+retries = 1
+
+# Codex has no slash commands for skills: the prompt asks for the skill in words
+# ("Use the implement skill"), so the skills must be where Codex finds them.

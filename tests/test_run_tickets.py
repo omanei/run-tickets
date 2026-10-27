@@ -1200,6 +1200,54 @@ def test_the_demo_runs_and_catches_the_agents_slip():
     assert "final review: done" in r.stdout
 
 
+
+# --- the example configs, and the config fragments in the READMEs -----------------------
+
+EXAMPLE_CONFIGS = sorted((ROOT / "examples" / "configs").glob("*.toml"))
+
+
+def load_config(path, tmp_path):
+    return rt.build_config(path, rt.parse_args(["run", str(tmp_path)]))
+
+
+@pytest.mark.parametrize("path", EXAMPLE_CONFIGS, ids=lambda p: p.name)
+def test_example_config_loads(path, tmp_path):
+    cfg = load_config(path, tmp_path)
+    assert cfg["config_path"] == str(path)
+
+
+def test_each_main_agent_has_an_example_config(tmp_path):
+    for agent in ("claude", "codex", "omp", "pi"):
+        assert load_config(ROOT / "examples" / "configs" / f"{agent}.toml", tmp_path)["agent"] == agent
+
+
+def test_the_example_configs_are_listed_in_their_readme():
+    listed = (ROOT / "examples" / "configs" / "README.md").read_text(encoding="utf-8")
+    assert EXAMPLE_CONFIGS
+    for path in EXAMPLE_CONFIGS:
+        assert f"]({path.name})" in listed, path.name
+
+
+def test_the_split_models_example_sets_a_model_per_step(tmp_path):
+    cfg = load_config(ROOT / "examples" / "configs" / "cheap-implement-strong-review.toml", tmp_path)
+    assert cfg["step"]["implement"]["model"] == "sonnet"
+    assert cfg["step"]["review"]["model"] == cfg["step"]["verify"]["model"] == "opus"
+    assert cfg["step"]["final"]["model"] == "opus"
+
+
+def readme_toml_blocks():
+    for name in ("README.md", "README.ru.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for i, block in enumerate(re.findall(r"```toml\n(.*?)```", text, re.S)):
+            yield pytest.param(block, id=f"{name}-{i}")
+
+
+@pytest.mark.parametrize("block", list(readme_toml_blocks()))
+def test_readme_config_fragment_loads(block, tmp_path):
+    path = tmp_path / "fragment.toml"
+    path.write_text(block, encoding="utf-8")
+    load_config(path, tmp_path)
+
 # --- the console ------------------------------------------------------------------
 
 
@@ -1517,3 +1565,64 @@ def test_release_check_names_every_mismatch(tmp_path):
     (tmp_path / "CHANGELOG.md").write_text("## 1.2.3 - 2026-02-01\n\n### Fixed\n- z\n\n## 1.2.2 - 2026-01-01\n\n- y\n")
     notes = release_check().check("1.2.3", tmp_path)
     assert notes.startswith("### Fixed\n- z\n\n### Install") and "- y" not in notes
+
+
+# --- the html report --------------------------------------------------------------
+
+
+def test_md_to_html():
+    page = rt.md_to_html("## Step report\n**Done** in `a.py`:\n\n- [x] header\n- [ ] quoting\n\n"
+                         "```python\nx = '<b>'\n```\n| a | b |\n|---|---|\n| 1 | <i> |\n> quoted\n"
+                         "see [docs](https://h/x) and [bad](javascript:alert(1)) <script>alert(1)</script>")
+    assert "<h4>Step report</h4>" in page
+    assert "<strong>Done</strong> in <code>a.py</code>:" in page
+    assert '<li class="task done">☑ header</li>' in page and '<li class="task ">☐ quoting</li>' in page
+    assert "<pre><code>x = &#x27;&lt;b&gt;&#x27;</code></pre>" in page
+    assert "<th>a</th>" in page and "<td>&lt;i&gt;</td>" in page
+    assert "<blockquote>quoted</blockquote>" in page
+    assert '<a href="https://h/x">docs</a>' in page and 'href="javascript' not in page  # http(s) links only
+    assert "<script>" not in page and "&lt;script&gt;" in page
+
+
+def test_parse_report_entries():
+    text = ("# x\n\n## 2026-10-27 09:05 01-first - implement: ok\n\n- log: /r/runs/a.log\n"
+            "- duration: 1m00s, exit code: 0\n- commits since abcdef0123: 1\n  - 1a2b3c first\n\n"
+            "> ## Step report\n> did it\n\n"
+            "## 2026-10-27 09:06 01-first - review: FAILED, retrying (1/1) - 1 acceptance criterion is not ticked\n\n"
+            "## 2026-10-27 09:07 STOPPED ON REQUEST (Ctrl+C) - before 02-second (implement)\n\n"
+            "## 2026-10-27 09:08 WORKTREE KEPT\n\n> files left\n")
+    e = rt.parse_report(text)
+    assert [(x["name"], x["step"], rt.entry_kind(x)) for x in e] == [
+        ("01-first", "implement", "ok"), ("01-first", "review", "retry"),
+        ("STOPPED ON REQUEST (Ctrl+C)", "", "stop"), ("WORKTREE KEPT", "", "info")]
+    assert e[0]["commits"] == ["1a2b3c first"] and e[0]["quote"] == ["## Step report", "did it"]
+    assert e[3]["quote"] == ["files left"]
+
+
+def test_html_report_after_a_run(basic):
+    basic.set_plan({"02-second:review": ["unticked", "ok"], "04-fourth:implement": ["needs-info"]})
+    basic.write_config(retries=1)
+    assert basic.run() == rt.EXIT_STOPPED
+    page = (basic.feature / "runs" / "report.html").read_text(encoding="utf-8")
+    assert page.startswith("<!doctype html>") and "<script" not in page and "<link" not in page
+    for name in ("01-first", "02-second", "03-third", "04-fourth"):
+        assert f'id="{name}"' in page
+    assert "step: review 01-first (ok)" in page  # the agent's report, rendered
+    assert 'class="step k-retry"' in page and 'class="step k-stop"' in page
+    assert "implement 01-first" in page  # its commit
+    assert "files changed" in page and "code.txt" in page
+    assert re.search(r'<a href="01-first-implement-[\d-]+\.log">', page)  # relative links to runs/
+    assert '<span class="badge stop">stopped</span>' in page
+
+
+def test_report_command(basic, capsys, monkeypatch):
+    assert rt.main(["report", str(basic.feature)]) == rt.EXIT_USAGE  # never run: no runs/
+    assert basic.run("--once") == 0
+    (basic.feature / "runs" / "report.html").unlink()
+    opened = []
+    monkeypatch.setattr(rt.webbrowser, "open", opened.append)
+    capsys.readouterr()
+    assert rt.main(["report", str(basic.feature), "--open"]) == 0
+    path = basic.feature / "runs" / "report.html"
+    assert capsys.readouterr().out.strip() == str(path) and path.exists()
+    assert opened == [path.resolve().as_uri()]

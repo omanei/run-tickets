@@ -1,0 +1,21 @@
+name: Feature request
+description: Something the runner should do, or do differently.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What goes wrong or takes too long today. A real run you had is the best example.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you propose
+      description: The behaviour, a config key or a command, and how it would look in the output.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead now
+      description: A workaround, a config, a script around the runner.

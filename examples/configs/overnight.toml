@@ -1,0 +1,20 @@
+# Unattended overnight: from tickets to a finished branch without a human, while your own
+# checkout stays usable. Start it so that a closed terminal and sleep do not stop it:
+#   nohup caffeinate -i run-tickets run .scratch/my-feature > run.out 2>&1 &      # macOS
+#   nohup systemd-inhibit run-tickets run .scratch/my-feature > run.out 2>&1 &    # Linux
+
+agent = "claude"
+test_command = "make test"    # after every step, and before each ticket (test_baseline)
+
+branch = "feat/{{feature}}"
+worktree = true               # a separate git worktree; removed at the end, the branch stays
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "make deps"]
+
+max_cost = 50                 # USD per run
+max_time = "2h"               # per step
+retries = 1
+limit_max_wait = "8h"         # wait out the provider's limit until the morning
+
+protected = ["migrations/", ".github/", "*.lock"]   # touching them stops the run
+
+notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'

@@ -7,10 +7,26 @@ All notable changes to this project are listed here. The format follows
 ## Unreleased
 
 ### Added
+- `runs/report.html`: the whole run on one page for the morning (#11). It shows the outcome,
+  time, cost and branch, then a section per ticket and for the final review. Each step has
+  its result, duration and links to its logs, and the agent's report is rendered from
+  markdown. Retries and stops are highlighted, then the commits and the files changed. It
+  is self-contained and works in light and dark themes. The runner rewrites it after every
+  ticket; `run-tickets report <feature> [--open]` rebuilds it.
 - omp and pi run with `--mode json` (the new `output = "pi-json"`): each tool call shows up
   as it starts, live and in `status`, like Claude's, and their cost is reported and counts
   toward `max_cost` (#10). A config that overrides their `command` without `--mode json`
   keeps working: the output is shown as text.
+- Ready configs in `examples/configs/`: one for each of `claude`, `codex`, `omp` and `pi`,
+  a cheaper model for implement with a stronger one for the reviews, hard budget limits,
+  and an unattended overnight setup (#15). A new Recipes section in the README covers
+  tests in Docker (and when `worktree = true` does not fit), a monorepo, `worktree_setup`
+  for Node and Python, Slack and Telegram notifications, and several features in one
+  run. A test loads every example and every config block in the READMEs, so they keep
+  up with the runner.
+- `CONTRIBUTING.md`, issue templates (a bug report, a feature request, an agent preset)
+  and a pull request template, and `docs/why.md` (`docs/why.ru.md`): why a runner, if the
+  agent can do it itself (#16).
 - Experimental presets for more agents: `gemini` (Gemini CLI), `qwen` (Qwen Code),
   `opencode`, `kilo` (Kilo CLI), `cursor` (Cursor CLI), `amp`, `droid` (Factory),
   `copilot` (GitHub Copilot CLI) and `goose`. They are made from each tool's

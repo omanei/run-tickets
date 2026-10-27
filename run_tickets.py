@@ -26,6 +26,7 @@ up as a branch in the repository, and pushing it is up to you.
   run-tickets status .scratch/my-feature     # what is done, what is next, what is stuck
   run-tickets config .scratch/my-feature     # effective settings and the agent commands
   run-tickets retry  .scratch/my-feature 05  # rerun the step ticket 05 stopped at
+  run-tickets report .scratch/my-feature     # runs/report.html: the whole run on one page
   run-tickets init                           # write an example .ticket-runner.toml
 
 State survives crashes: <feature>/runs/state.json is rewritten atomically before and
@@ -41,8 +42,10 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import dataclasses
 import datetime as dt
 import fnmatch
+import html
 import json
 import os
 import re
@@ -57,6 +60,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -1627,6 +1631,7 @@ EXAMPLE_CONFIG = '''# run-tickets config: https://github.com/omanei/run-tickets#
 # root. Command-line flags win over this file. Every key is optional: the commented
 # lines show the defaults; uncomment and change only what your project needs.
 # `run-tickets config <feature dir>` prints the effective values and the agent commands.
+# Ready configs per agent and setup: https://github.com/omanei/run-tickets/tree/master/examples/configs
 
 agent = "{{init_agent}}"           # a preset (`run-tickets init --help` lists them) or [agents.<name>]
 # model = ""                # passed to the agent (its model_args) when set
@@ -2148,6 +2153,402 @@ def feature_rel(feature: Feature, git: Git) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# What the runner shows. The runner tells a view what happened, with the data and no
+# text; PlainView turns that into plain lines (a log, a pipe, CI: keep them stable),
+# LiveView into the live view on a terminal.
+
+
+class PlainView:
+    def __init__(self, feature: "Feature"):
+        self.feature = feature
+
+    # -- lines that are the same idea in both views ----------------------------
+
+    def note(self, text: str) -> None:
+        """Something the runner did or found, worth a line."""
+        say(f"==> {text}")
+
+    def line(self, text: str) -> None:
+        say(text)
+
+    def warning(self, text: str) -> None:
+        warn(text)
+
+    def notification(self, message: str) -> None:
+        """The one-line notification text: plain output shows it, the live view has its boxes."""
+        say(message)
+
+    # -- the run ---------------------------------------------------------------
+
+    def run_started(self, data: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+        git_info = data.get("git", {})
+        say(f"run-tickets {__version__}: {self.feature.dir} with agent '{cfg['agent']}'"
+            + (f" ({cfg['config_path']})" if cfg["config_path"] else "")
+            + (f", branch {git_info['branch']}" if git_info.get("branch") else ""))
+
+    def ticket_started(self, ticket: "Ticket") -> None:
+        pass
+
+    def final_started(self, base: str) -> None:
+        pass
+
+    def step_started(self, unit: Any, step: str, who: str, attempt: int, attempts: int, log: Path) -> None:
+        say(f"==> {unit.name}: {step} with {who} (log: {log})")
+
+    def agent_output(self, items: List[Tuple[str, str, str]], step: str, markdown: bool) -> None:
+        shown = describe_items(items)
+        if shown is not None:
+            say(shown)
+
+    def agent_output_end(self, items: List[Tuple[str, str, str]], step: str, markdown: bool) -> None:
+        self.agent_output(items, step, markdown)
+
+    def agent_running(self, unit: Any, step: str, attempt: int, attempts: int,
+                      progress: Callable[[], Tuple[float, float]]) -> Any:
+        """A context for the time the agent runs (the live view's status line)."""
+        return contextlib.nullcontext()
+
+    def step_timed_out(self, unit: Any, step: str, max_time: str) -> None:
+        say(f"==> {unit.name}: {step} hit max_time {max_time}, killing it")
+
+    def step_passed(self, unit: Any, step: str, seconds: float, commits: Optional[int],
+                    cost: Optional[float]) -> None:
+        pass
+
+    def step_failed(self, unit: Any, step: str, reason: str, seconds: float) -> None:
+        pass
+
+    def limit_wait(self, unit: Any, until: dt.datetime) -> None:
+        say(f"==> {unit.name}: the provider's limit was hit; waiting until {until:%H:%M}")
+
+    def retrying(self, unit: Any, step: str, reason: str, attempt: int, attempts: int, delay: int) -> None:
+        say(f"==> {unit.name}: {step} failed ({reason}); retrying with a fresh process"
+            + (f" in {fmt_duration(delay)}" if delay else ""))
+
+    def waiting(self, what: str, seconds: float) -> Any:
+        """A context for a pause (a provider limit, a retry delay)."""
+        return contextlib.nullcontext()
+
+    def tests_started(self, label: str, cmd: str) -> None:
+        say(f"==> {label}: running the tests ({cmd})")
+
+    def tests_running(self, label: str) -> Any:
+        return contextlib.nullcontext()
+
+    def tests_finished(self, passed: bool, seconds: float, log: Path) -> None:
+        pass
+
+    def ticket_done(self, ticket: "Ticket", commits: int, seconds: float) -> None:
+        say(f"==> {ticket.name} done: {commits} commit(s)")
+
+    def done_this_run(self, rows: List[Tuple[str, float, int]], cost: float) -> None:
+        say("\nDone in this run:")
+        for name, seconds, commits in rows:
+            say(f"  {name}: {fmt_duration(seconds)}, {commits} commit(s)")
+        say(f"summary: {self.feature.runs / 'SUMMARY.md'}")
+        say(f"html report: {self.feature.runs / 'report.html'}")
+
+    def paused(self, ticket: "Ticket") -> None:
+        pass
+
+    def stopped(self, unit: Any, step: str, reason: str, run: Optional["StepRun"]) -> None:
+        if run is not None:
+            say(f"log: {run.log}")
+            say(f"transcript: {run.transcript or 'none'}")
+        say(f"report: {self.feature.runs / 'REPORT.md'}")
+
+    def stopped_on_request(self, where: str) -> None:
+        say(f"\nstopped as asked (Ctrl+C), before {where}; the state is saved, run the same "
+            f"command to go on")
+
+    def blocked(self, tickets: List["Ticket"]) -> None:
+        index = self.feature.by_number()
+        say("open:")
+        for t in tickets:
+            why = self.feature.waiting_on(t, index)
+            extra = f", waiting on {', '.join(why)}" if why and t.status() == RUNNABLE else ""
+            say(f"  {t.name} - {t.status() or 'no status'}{extra}")
+
+    def finished(self, branch: str, base_branch: str, repo: Path) -> None:
+        say(f"\nThe work is on branch {branch} in {repo}:")
+        if base_branch:
+            say(f"  git log --oneline {base_branch}..{branch}")
+            say(f"  git diff {base_branch}...{branch}")
+        say(f"  git push -u origin {branch}     # when you want it on the server")
+
+    # -- uncommitted edits a step left -------------------------------------------
+
+    def dirty_tree(self, repo: Path, dirty: str, pending: Optional[str]) -> None:
+        warn(f"the working tree {repo} has uncommitted changes; commit or stash them first:")
+        warn(dirty)
+        if pending:
+            warn(f"\n{pending} was interrupted or stopped mid-step, so these may be the "
+                 f"agent's unfinished edits. To let the agent continue with them, rerun "
+                 f"with --adopt-dirty.")
+
+    def can_ask(self, no_input: bool) -> bool:
+        """Someone is at the terminal to answer: never with plain output."""
+        return False
+
+    def ask_dirty(self, name: str, phase: str, dirty: str) -> str:
+        return "q"
+
+
+class LiveView(PlainView):
+    """Colors, rendered markdown, a status line under the output, boxes for the outcomes."""
+
+    def __init__(self, feature: "Feature"):
+        super().__init__(feature)
+        self.md = Markdown(UI)
+
+    def note(self, text: str) -> None:
+        UI.write(UI.style("›", "cyan") + " " + text)
+
+    def line(self, text: str) -> None:
+        UI.write(text)
+
+    def warning(self, text: str) -> None:
+        UI.write(UI.style(text, "yellow"), err=True)
+
+    def notification(self, message: str) -> None:
+        pass
+
+    def run_started(self, data: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+        with self.feature.snapshot():
+            model = status_model(self.feature, data)
+            UI.write("\n".join(live_header(model, cfg) + live_ticket_rows(model)))
+
+    def ticket_started(self, ticket: "Ticket") -> None:
+        with self.feature.snapshot():
+            tickets = self.feature.tickets()
+            done = sum(t.status() == DONE for t in tickets)
+        UI.write("\n" + UI.rule(f"{ticket.number:02d} {ticket.title()}", f"{done}/{len(tickets)} done"))
+
+    def final_started(self, base: str) -> None:
+        UI.write("\n" + UI.rule("final review of the whole feature", f"since {base[:10]}", "yellow"))
+
+    def step_started(self, unit: Any, step: str, who: str, attempt: int, attempts: int, log: Path) -> None:
+        self.md = Markdown(UI)
+        UI.write(f"{UI.chip(step)} {UI.style(f'{who} · attempt {attempt}/{attempts}', 'gray')}\n"
+                 f"  {UI.style('log ' + UI.path(log), 'gray')}")
+
+    # -- the agent's output, behind the step's gutter ------------------------------
+
+    @staticmethod
+    def gutter(step: str) -> str:
+        return "  " + UI.style("│", STEP_COLORS.get(step, "gray")) + " "
+
+    def agent_line(self, step: str, text: str) -> None:
+        """A line of the agent's output behind the step's gutter, wrapped here rather than
+        by the terminal, so that every screen line keeps the gutter."""
+        gutter = self.gutter(step)
+        for line in wrap(text, UI.width() - 1 - visible_len(gutter)):
+            UI.write(gutter + line)
+
+    def agent_output(self, items: List[Tuple[str, str, str]], step: str, markdown: bool) -> None:
+        """Markdown rendered (unless the agent prints raw tool output: markdown = false),
+        tool calls on a line of their own."""
+        for kind, a, b in items:
+            if kind != "text":
+                for rendered in self.md.flush():
+                    self.agent_line(step, rendered)
+            if kind == "tool":
+                self.agent_line(step, UI.style("▸ ", "cyan") + UI.style(a, "bold")
+                                + (" " + UI.style(b, "gray") if b else ""))
+            elif kind == "result":
+                self.agent_line(step, UI.style(f"▸ result: {a}", "gray"))
+            elif kind == "note":
+                self.agent_line(step, UI.style(f"▸ {a}", "yellow"))
+            else:
+                for sub in a.split("\n"):
+                    sub = sub.rstrip("\r").split("\r")[-1]  # progress bars redraw with \r
+                    if "\x1b" in sub and UI.color:  # the agent colors its output: keep the colors only
+                        kept = ANSI_RE.sub(lambda m: m.group(0) if SGR_RE.fullmatch(m.group(0)) else "", sub)
+                        self.agent_line(step, kept + "\x1b[0m")
+                        continue
+                    sub = ANSI_RE.sub("", sub)
+                    if not markdown:
+                        self.agent_line(step, sub)
+                        continue
+                    for rendered in self.md.feed(sub):
+                        self.agent_line(step, rendered)
+
+    def agent_output_end(self, items: List[Tuple[str, str, str]], step: str, markdown: bool) -> None:
+        self.agent_output(items, step, markdown)
+        for rendered in self.md.flush():
+            self.agent_line(step, rendered)
+
+    # -- the status line -------------------------------------------------------
+
+    def board(self, current: str = "") -> str:
+        """The progress bar and an icon per ticket."""
+        with self.feature.snapshot():
+            tickets = self.feature.tickets()
+            done = sum(t.status() == DONE for t in tickets)
+            icons = [UI.ticket_icon(t.status(), t.name == current)
+                     + (UI.style(f"{t.number:02d}", "gray") if len(tickets) <= 12 else "")
+                     for t in tickets]
+        return f"{UI.bar(done, len(tickets))} {done}/{len(tickets)} done  " + " ".join(icons)
+
+    def agent_running(self, unit: Any, step: str, attempt: int, attempts: int,
+                      progress: Callable[[], Tuple[float, float]]) -> Any:
+        board = self.board(unit.name)  # read once: tickets change between steps, not between redraws
+        label = f"{unit.number:02d} {unit.title()}" if unit.name != FINAL else "final review of the whole feature"
+        color = STEP_COLORS.get(step, "gray")
+        started = time.monotonic()
+
+        def status(frame: int) -> List[str]:
+            last_output, cost = progress()
+            bits = [UI.style(label, "bold"), UI.style(step, color), f"attempt {attempt}/{attempts}",
+                    fmt_duration(time.monotonic() - started)]
+            quiet = time.monotonic() - last_output
+            if quiet >= 60:
+                bits.append(UI.style(f"no output for {fmt_duration(quiet)}", "yellow"))
+            if cost:
+                bits.append(fmt_cost(cost))
+            spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], color, "bold")
+            return [f"{spin} " + UI.style(" · ", "gray").join(bits), f"  {board}   " + stop_hint()]
+
+        return UI.showing(status)
+
+    def waiting(self, what: str, seconds: float) -> Any:
+        until = time.monotonic() + seconds
+
+        def status(frame: int) -> List[str]:
+            left = max(0, until - time.monotonic())
+            spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], "yellow")
+            return [f"{spin} {what} · {fmt_duration(left)} left", "  " + stop_hint()]
+
+        return UI.showing(status)
+
+    def tests_running(self, label: str) -> Any:
+        started = time.monotonic()
+
+        def status(frame: int) -> List[str]:
+            spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], "cyan")
+            return [f"{spin} {label}: running the tests · {fmt_duration(time.monotonic() - started)}"]
+
+        return UI.showing(status)
+
+    # -- step and ticket results ---------------------------------------------------
+
+    def step_timed_out(self, unit: Any, step: str, max_time: str) -> None:
+        UI.write(UI.style(f"⏱ {step} hit max_time {max_time}; killing the agent", "red"))
+
+    def step_passed(self, unit: Any, step: str, seconds: float, commits: Optional[int],
+                    cost: Optional[float]) -> None:
+        bits = [fmt_duration(seconds)]
+        if commits is not None:
+            bits.append(f"{commits} commit{'' if commits == 1 else 's'}" if commits else "no commits")
+        if cost:
+            bits.append(fmt_cost(cost))
+        UI.write(f"  {UI.style('✓', 'green')} {UI.style(f'{step} passed', 'green', 'bold')} "
+                 + UI.style(" · ".join(bits), "gray"))
+
+    def step_failed(self, unit: Any, step: str, reason: str, seconds: float) -> None:
+        UI.write(f"  {UI.style('✗', 'red')} {UI.style(f'{step} failed:', 'red', 'bold')} "
+                 f"{reason.splitlines()[0]} {UI.style(fmt_duration(seconds), 'gray')}")
+
+    def limit_wait(self, unit: Any, until: dt.datetime) -> None:
+        UI.write(f"  {UI.style('⏸', 'yellow')} the provider's limit was hit; "
+                 f"waiting until {until:%H:%M}, then the step goes on")
+
+    def retrying(self, unit: Any, step: str, reason: str, attempt: int, attempts: int, delay: int) -> None:
+        UI.write(f"  {UI.style('↻', 'yellow')} retrying with a fresh process ({attempt}/{attempts - 1})"
+                 + (f" in {fmt_duration(delay)}" if delay else ""))
+
+    def tests_started(self, label: str, cmd: str) -> None:
+        UI.write(f"  {UI.style('⧗', 'cyan')} running the tests {UI.style(cmd, 'gray')}")
+
+    def tests_finished(self, passed: bool, seconds: float, log: Path) -> None:
+        took = fmt_duration(seconds)
+        UI.write(f"  {UI.style('✓', 'green')} tests passed {UI.style(took, 'gray')}" if passed else
+                 f"  {UI.style('✗', 'red')} tests failed {UI.style(f'{took} · log {UI.path(log)}', 'gray')}")
+
+    def ticket_done(self, ticket: "Ticket", commits: int, seconds: float) -> None:
+        UI.write(f"{UI.style('✓', 'green', 'bold')} {UI.style(f'{ticket.number:02d} {ticket.title()}', 'bold')} "
+                 + UI.style(f"done · {commits} commit{'' if commits == 1 else 's'} · {fmt_duration(seconds)}",
+                            "green"))
+
+    def done_this_run(self, rows: List[Tuple[str, float, int]], cost: float) -> None:
+        width = max(len(n) for n, _, _ in rows)
+        lines = [UI.style("Done in this run", "bold")]
+        for name, seconds, commits in rows:
+            lines.append(f"  {UI.style('✓', 'green')} {name.ljust(width)}  "
+                         + UI.style(f"{fmt_duration(seconds)} · {commits} commit{'' if commits == 1 else 's'}",
+                                    "gray"))
+        if cost:
+            lines.append(UI.style(f"  cost {fmt_cost(cost)}", "gray"))
+        lines.append(UI.style(f"summary {UI.path(self.feature.runs / 'SUMMARY.md')}", "gray"))
+        lines.append(UI.style(f"report  {UI.path(self.feature.runs / 'report.html')}", "gray"))
+        UI.write("\n" + "\n".join(lines))
+
+    # -- outcomes, in a box ----------------------------------------------------------
+
+    def box(self, lines: List[str], title: str, color: str) -> None:
+        UI.write("\n" + "\n".join(UI.box(lines, title, color)))
+
+    def paused(self, ticket: "Ticket") -> None:
+        self.box([UI.style(f"⏸ paused after {ticket.name} (pause_after)", "yellow", "bold"),
+                  "have a look, then run the same command to continue"], "paused", "yellow")
+
+    def stopped(self, unit: Any, step: str, reason: str, run: Optional["StepRun"]) -> None:
+        where = f"{unit.name} ({step})" if unit else step
+        lines = [UI.style(f"✗ stopped at {where}", "red", "bold"), *reason.splitlines(), ""]
+        if run is not None:
+            lines.append(UI.style("log         ", "gray") + UI.path(run.log))
+            lines.append(UI.style("transcript  ", "gray") + (UI.path(run.transcript) if run.transcript else "none"))
+        lines.append(UI.style("report      ", "gray") + UI.path(self.feature.runs / "REPORT.md"))
+        if unit is not None:
+            ref = "final" if unit.name == FINAL else f"{unit.number:02d}"
+            lines += ["", UI.style("fix the cause, then rerun the step:", "gray"),
+                      f"  run-tickets retry {UI.path_arg(self.feature.dir)} {ref}"]
+        self.box(lines, "stopped", "red")
+
+    def stopped_on_request(self, where: str) -> None:
+        self.box([UI.style(f"■ stopped as asked, before {where}", "yellow", "bold"),
+                  "the state is saved; run the same command to go on"], "stopped", "yellow")
+
+    def blocked(self, tickets: List["Ticket"]) -> None:
+        index = self.feature.by_number()
+        lines = [UI.style(f"nothing runnable; {len(tickets)} ticket(s) open", "yellow", "bold")]
+        for t in tickets:
+            why = self.feature.waiting_on(t, index)
+            extra = f", waiting on {', '.join(why)}" if why and t.status() == RUNNABLE else ""
+            lines.append(f"  {UI.ticket_icon(t.status())} {t.name} {UI.style((t.status() or 'no status') + extra, 'gray')}")
+        self.box(lines, "blocked", "yellow")
+
+    def finished(self, branch: str, base_branch: str, repo: Path) -> None:
+        tickets = self.feature.tickets()
+        lines = [UI.style(f"✓ every ticket is done ({len(tickets)})", "green", "bold"),
+                 f"the work is on branch {UI.style(branch, 'bold')} in {UI.path(repo)}", ""]
+        if base_branch:
+            lines += [f"  git log --oneline {base_branch}..{branch}", f"  git diff {base_branch}...{branch}"]
+        lines.append(f"  git push -u origin {branch}  " + UI.style("# when you want it on the server", "gray"))
+        self.box(lines, "done", "green")
+
+    def can_ask(self, no_input: bool) -> bool:
+        return UI.tty and not no_input and sys.stdin is not None and sys.stdin.isatty()
+
+    def ask_dirty(self, name: str, phase: str, dirty: str) -> str:
+        """What to do with the uncommitted edits a cut-off step left: c, s or q."""
+        self.box([UI.style(f"{name} did not finish its {phase} step; these edits are not committed:",
+                           "yellow", "bold"),
+                  *dirty.splitlines(), "",
+                  f"{UI.style('c', 'bold')}  continue with them (as --adopt-dirty): the agent finishes its own work",
+                  f"{UI.style('s', 'bold')}  set them aside with git stash and redo the step from its last commit",
+                  f"{UI.style('q', 'bold')}  quit, leaving everything as it is"], "uncommitted edits", "yellow")
+        while True:
+            try:
+                answer = input("c / s / q? ").strip().lower()[:1]
+            except (EOFError, KeyboardInterrupt):
+                UI.write("")
+                return "q"
+            if answer in ("c", "s", "q"):
+                return answer
+
+
+# ---------------------------------------------------------------------------
 # The runner
 
 
@@ -2173,6 +2574,7 @@ class Runner:
         self.failure_detail = ""  # test output of the last failed check, for the retry
         self.last_tests: Optional[Tuple[Path, bool]] = None
         self.last_output = time.monotonic()  # of the running agent, for the status line
+        self.view: PlainView = (LiveView if UI.live else PlainView)(feature)
 
     # -- bookkeeping -------------------------------------------------------
 
@@ -2234,8 +2636,7 @@ class Runner:
         return out
 
     def notify(self, message: str) -> None:
-        if not UI.live:  # the live view shows every outcome in a box of its own
-            say(message)
+        self.view.notification(message)
         title = "run-tickets"
         try:
             if not self.cfg.get("desktop_notify", True):
@@ -2265,7 +2666,7 @@ class Runner:
             try:
                 subprocess.run(cmd, shell=True, env=env, timeout=60, capture_output=True)
             except (OSError, subprocess.SubprocessError) as e:
-                warn(f"notify_command failed: {e}")
+                self.view.warning(f"notify_command failed: {e}")
 
     def account(self, unit: Any, run: StepRun) -> None:
         entry = self.state.ticket(unit.name)
@@ -2305,6 +2706,11 @@ class Runner:
                          f"{fmt_duration(fe.get('seconds', 0))} | {fmt_cost(fe.get('cost'))} |")
         lines += ["", f"Details: {self.report}", ""]
         atomic_write(self.summary_path, "\n".join(lines))
+        self.state.set(outcome={"outcome": outcome, "detail": detail, "time": iso()})
+        try:
+            write_html_report(self.feature, self.main_git)
+        except Exception as e:  # noqa: BLE001 - the page is a convenience; the run goes on
+            self.event("html_report_failed", error=repr(e))
         short = f"{self.feature.name}: {done}/{len(tickets)} done"
         if outcome != "done" or detail:
             short += f"; {outcome}" + (f" - {detail}" if detail else "")
@@ -2380,10 +2786,8 @@ class Runner:
         output = agent["output"]
         stream = output != "text"
         who = sc["agent"] + (f" ({sc['model']})" if sc["model"] else "")
-        attempts = f"attempt {attempt}/{self.cfg['retries'] + 1}"
-        say(f"==> {unit.name}: {step} with {who} (log: {run.log})",
-            live=f"{UI.chip(step)} {UI.style(f'{who} · {attempts}', 'gray')}\n"
-                 f"  {UI.style('log ' + UI.path(run.log), 'gray')}")
+        attempts = self.cfg["retries"] + 1
+        self.view.step_started(unit, step, who, attempt, attempts, run.log)
         self.event("agent_start", ticket=unit.name, step=step, log=str(run.log),
                    argv=[a if a != prompt else "<prompt>" for a in argv])
         self.state.set(current={"ticket": unit.name, "step": step, "attempt": attempt,
@@ -2407,7 +2811,6 @@ class Runner:
                         pass
 
                 proc = self.proc
-                md = Markdown(UI)
                 stream_reader = StreamReader(output)
                 self.last_output = time.monotonic()
 
@@ -2420,49 +2823,26 @@ class Runner:
                             log.flush()
                             self.last_output = time.monotonic()
                             try:
-                                if UI.live:
-                                    line = line.rstrip("\r\n").split("\r")[-1]  # progress bars redraw with \r
-                                    self.show_output(md, stream_reader.feed(line), step, agent["markdown"])
-                                    continue
-                                shown = describe_items(stream_reader.feed(line)) if stream else line.rstrip("\n")
-                                if shown is not None:
-                                    say(shown)
+                                self.view.agent_output(stream_reader.feed(line), step, agent["markdown"])
                             except Exception:  # noqa: BLE001 - showing a line must never stop
                                 # the reading: an undrained pipe would block the agent.
                                 pass
                     except (OSError, ValueError):
                         pass
                     try:  # what the output held back: a reply in chunks, a table, a code block
-                        if UI.live:
-                            self.show_output(md, stream_reader.flush(), step, agent["markdown"])
-                            for rendered in md.flush():
-                                self.agent_line(step, rendered)
-                        else:
-                            shown = describe_items(stream_reader.flush())
-                            if shown is not None:
-                                say(shown)
+                        self.view.agent_output_end(stream_reader.flush(), step, agent["markdown"])
                     except Exception:  # noqa: BLE001
                         pass
 
                 reader = threading.Thread(target=pump, daemon=True)
                 reader.start()
-                started_step = time.monotonic()
-                # Read once: the ticket files change between steps, not during the redraws.
-                board = self.board(unit.name) if UI.live else ""
-                label = (f"{unit.number:02d} {unit.title()}" if unit.name != FINAL
-                         else "final review of the whole feature")
-
-                def status(frame: int) -> List[str]:
-                    return self.step_status(frame, label, step, attempt, started_step, board)
-
-                with UI.showing(status):
+                with self.view.agent_running(unit, step, attempt, attempts,
+                                             lambda: (self.last_output, self.run_cost)):
                     try:
                         run.code = proc.wait(timeout=sc["max_seconds"])
                     except subprocess.TimeoutExpired:
                         run.timed_out = True
-                        say(f"==> {unit.name}: {step} hit max_time {sc['max_time']}, killing it",
-                            live=UI.style(f"⏱ {step} hit max_time {sc['max_time']}; "
-                                          f"killing the agent", "red"))
+                        self.view.step_timed_out(unit, step, sc["max_time"])
                         kill_tree(proc)
                         run.code = proc.wait()
                     except BaseException:
@@ -2489,92 +2869,6 @@ class Runner:
         self.event("agent_end", ticket=unit.name, step=step, code=run.code,
                    timed_out=run.timed_out, seconds=round(run.seconds), cost=run.cost)
         return run
-
-    # -- the live view ------------------------------------------------------
-
-    @staticmethod
-    def gutter(step: str) -> str:
-        return "  " + UI.style("│", STEP_COLORS.get(step, "gray")) + " "
-
-    def agent_line(self, step: str, text: str) -> None:
-        """A line of the agent's output behind the step's gutter, wrapped here rather than
-        by the terminal, so that every screen line keeps the gutter."""
-        gutter = self.gutter(step)
-        for line in wrap(text, UI.width() - 1 - visible_len(gutter)):
-            UI.write(gutter + line)
-
-    def show_output(self, md: Markdown, items: List[Tuple[str, str, str]], step: str,
-                    markdown: bool) -> None:
-        """Items of the agent's output in the live view: markdown rendered (unless the
-        agent prints raw tool output: markdown = false), tool calls on a line of their own."""
-        for kind, a, b in items:
-            if kind != "text":
-                for rendered in md.flush():
-                    self.agent_line(step, rendered)
-            if kind == "tool":
-                self.agent_line(step, UI.style("▸ ", "cyan") + UI.style(a, "bold")
-                         + (" " + UI.style(b, "gray") if b else ""))
-            elif kind == "result":
-                self.agent_line(step, UI.style(f"▸ result: {a}", "gray"))
-            elif kind == "note":
-                self.agent_line(step, UI.style(f"▸ {a}", "yellow"))
-            else:
-                for sub in a.split("\n"):
-                    if "\x1b" in sub and UI.color:  # the agent colors its output: keep the colors only
-                        kept = ANSI_RE.sub(lambda m: m.group(0) if SGR_RE.fullmatch(m.group(0)) else "", sub)
-                        self.agent_line(step, kept + "\x1b[0m")
-                        continue
-                    sub = ANSI_RE.sub("", sub)
-                    if not markdown:
-                        self.agent_line(step, sub)
-                        continue
-                    for rendered in md.feed(sub):
-                        self.agent_line(step, rendered)
-
-    def show_step_result(self, unit: Any, step: str, run: StepRun) -> None:
-        bits = [fmt_duration(run.seconds)]
-        try:
-            n = len(self.git.commits(self.state.ticket(unit.name).get("step_head") or "HEAD"))
-            bits.append(f"{n} commit{'' if n == 1 else 's'}" if n else "no commits")
-        except RuntimeError:
-            pass
-        if run.cost:
-            bits.append(fmt_cost(run.cost))
-        UI.write(f"  {UI.style('✓', 'green')} {UI.style(f'{step} passed', 'green', 'bold')} "
-                 + UI.style(" · ".join(bits), "gray"))
-
-    def board(self, current: str = "") -> str:
-        """The progress bar and an icon per ticket, for the status line."""
-        with self.feature.snapshot():
-            tickets = self.feature.tickets()
-            done = sum(t.status() == DONE for t in tickets)
-            icons = [UI.ticket_icon(t.status(), t.name == current)
-                     + (UI.style(f"{t.number:02d}", "gray") if len(tickets) <= 12 else "")
-                     for t in tickets]
-        return f"{UI.bar(done, len(tickets))} {done}/{len(tickets)} done  " + " ".join(icons)
-
-    def step_status(self, frame: int, label: str, step: str, attempt: int, started: float,
-                    board: str) -> List[str]:
-        color = STEP_COLORS.get(step, "gray")
-        bits = [UI.style(label, "bold"),
-                UI.style(step, color),
-                f"attempt {attempt}/{self.cfg['retries'] + 1}",
-                fmt_duration(time.monotonic() - started)]
-        quiet = time.monotonic() - self.last_output
-        if quiet >= 60:
-            bits.append(UI.style(f"no output for {fmt_duration(quiet)}", "yellow"))
-        if self.run_cost:
-            bits.append(fmt_cost(self.run_cost))
-        spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], color, "bold")
-        return [f"{spin} " + UI.style(" · ", "gray").join(bits), f"  {board}   " + stop_hint()]
-
-    def waiting_status(self, what: str, until: float) -> Callable[[int], List[str]]:
-        def status(frame: int) -> List[str]:
-            left = max(0, until - time.monotonic())
-            spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], "yellow")
-            return [f"{spin} {what} · {fmt_duration(left)} left",
-                    "  " + stop_hint()]
-        return status
 
     def export_transcript(self, agent: Dict[str, Any], session_dir: Path, stamp: str) -> Optional[Path]:
         cmd = agent.get("export_command") or []
@@ -2625,23 +2919,13 @@ class Runner:
         log = self.feature.runs / f"{label}-tests-{now():%Y%m%d-%H%M%S}.log"
         if log.exists():
             log = log.with_name(log.stem + f"-{uuid.uuid4().hex[:4]}.log")
-        say(f"==> {label}: running the tests ({cmd})",
-            live=f"  {UI.style('⧗', 'cyan')} running the tests {UI.style(cmd, 'gray')}")
+        self.view.tests_started(label, cmd)
         started = time.monotonic()
-
-        def status(frame: int) -> List[str]:
-            spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], "cyan")
-            return [f"{spin} {label}: running the tests · {fmt_duration(time.monotonic() - started)}"]
-
-        with UI.showing(status):
+        with self.view.tests_running(label):
             code, timed_out = self.run_shell(cmd, log, self.cfg["test_timeout_seconds"])
-        took = fmt_duration(time.monotonic() - started)
         self.last_tests = (log, code == 0 and not timed_out)
         self.event("tests", label=label, code=code, timed_out=timed_out, log=str(log))
-        if UI.live:
-            UI.write(f"  {UI.style('✓', 'green')} tests passed {UI.style(took, 'gray')}"
-                     if code == 0 and not timed_out else
-                     f"  {UI.style('✗', 'red')} tests failed {UI.style(f'{took} · log {UI.path(log)}', 'gray')}")
+        self.view.tests_finished(code == 0 and not timed_out, time.monotonic() - started, log)
         if code == 0 and not timed_out:
             return None
         self.failure_detail = tail_text(log, 3000)
@@ -2741,35 +3025,11 @@ class Runner:
         self.event("stopped", ticket=unit.name if unit else None, step=step, reason=reason)
         where = f"{unit.name} ({step})" if unit else step
         self.notify(self.write_summary("stopped", f"at {where}: {reason.splitlines()[0]}"))
-        if UI.live:
-            lines = [UI.style(f"✗ stopped at {where}", "red", "bold"), *reason.splitlines(), ""]
-            if run is not None:
-                lines.append(UI.style("log         ", "gray") + UI.path(run.log))
-                lines.append(UI.style("transcript  ", "gray")
-                             + (UI.path(run.transcript) if run.transcript else "none"))
-            lines.append(UI.style("report      ", "gray") + UI.path(self.report))
-            if unit is not None:
-                ref = "final" if unit.name == FINAL else f"{unit.number:02d}"
-                lines += ["", UI.style("fix the cause, then rerun the step:", "gray"),
-                          f"  run-tickets retry {UI.path_arg(self.feature.dir)} {ref}"]
-            UI.write("\n" + "\n".join(UI.box(lines, "stopped", "red")))
-            return EXIT_STOPPED
-        if run is not None:
-            say(f"log: {run.log}")
-            say(f"transcript: {run.transcript or 'none'}")
-        say(f"report: {self.report}")
+        self.view.stopped(unit, step, reason, run)
         return EXIT_STOPPED
 
     def run(self) -> int:
-        git_info = self.state.data.get("git", {})
-        if UI.live:
-            with self.feature.snapshot():
-                UI.write("\n".join(live_header(self.feature, self.state.data, self.cfg)
-                                   + live_ticket_rows(self.feature, self.state.data)))
-        else:
-            say(f"run-tickets {__version__}: {self.feature.dir} with agent '{self.cfg['agent']}'"
-                + (f" ({self.cfg['config_path']})" if self.cfg["config_path"] else "")
-                + (f", branch {git_info['branch']}" if git_info.get("branch") else ""))
+        self.view.run_started(self.state.data, self.cfg)
         self.event("run_start", agent=self.cfg["agent"], pid=os.getpid())
         self.rotate_logs()
         if self.state.data.get("waiting"):
@@ -2790,20 +3050,16 @@ class Runner:
             choice = ""
             if pending and self.opts.adopt_dirty:
                 choice = "c"
-            elif pending and self.can_ask():
-                choice = self.ask_dirty(pending[0], dirty)
+            elif pending and self.view.can_ask(getattr(self.opts, "no_input", False)):
+                phase = (self.state.data["tickets"].get(pending[0]) or {}).get("phase", "")
+                choice = self.view.ask_dirty(pending[0], phase, dirty)
             if choice == "s" and not self.set_aside(pending[0]):
                 choice = "q"
             if choice == "q":
-                say("nothing changed; run the same command again to choose again")
+                self.view.line("nothing changed; run the same command again to choose again")
                 return EXIT_USAGE
             if not choice:
-                warn(f"the working tree {self.git.repo} has uncommitted changes; commit or stash them first:")
-                warn(dirty)
-                if pending:
-                    warn(f"\n{pending[0]} was interrupted or stopped mid-step, so these may be the "
-                         f"agent's unfinished edits. To let the agent continue with them, rerun "
-                         f"with --adopt-dirty.")
+                self.view.dirty_tree(self.git.repo, dirty, pending[0] if pending else None)
                 return EXIT_USAGE
         pre = self.preflight("start")
         if pre:
@@ -2843,36 +3099,8 @@ class Runner:
         append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} STOPPED ON REQUEST (Ctrl+C) - before {where}\n\n")
         self.write_summary("stopped on request", f"before {where}; run the same command to go on")
         self.print_done()
-        say(f"\nstopped as asked (Ctrl+C), before {where}; the state is saved, run the same "
-            f"command to go on",
-            live="\n" + "\n".join(UI.box([UI.style(f"■ stopped as asked, before {where}", "yellow", "bold"),
-                                           "the state is saved; run the same command to go on"],
-                                          "stopped", "yellow")))
+        self.view.stopped_on_request(where)
         return EXIT_INTERRUPTED
-
-    def can_ask(self) -> bool:
-        """Someone is at the terminal to answer (never in a piped, nohup or CI run)."""
-        return (UI.live and UI.tty and not getattr(self.opts, "no_input", False)
-                and sys.stdin is not None and sys.stdin.isatty())
-
-    def ask_dirty(self, name: str, dirty: str) -> str:
-        """What to do with the uncommitted edits a cut-off step left: c, s or q."""
-        phase = (self.state.data["tickets"].get(name) or {}).get("phase", "")
-        lines = [UI.style(f"{name} did not finish its {phase} step; these edits are not committed:",
-                          "yellow", "bold"),
-                 *dirty.splitlines(), "",
-                 f"{UI.style('c', 'bold')}  continue with them (as --adopt-dirty): the agent finishes its own work",
-                 f"{UI.style('s', 'bold')}  set them aside with git stash and redo the step from its last commit",
-                 f"{UI.style('q', 'bold')}  quit, leaving everything as it is"]
-        UI.write("\n" + "\n".join(UI.box(lines, "uncommitted edits", "yellow")))
-        while True:
-            try:
-                answer = input("c / s / q? ").strip().lower()[:1]
-            except (EOFError, KeyboardInterrupt):
-                UI.write("")
-                return "q"
-            if answer in ("c", "s", "q"):
-                return answer
 
     def set_aside(self, name: str) -> bool:
         """`git stash` of the working tree's tracked edits, outside the feature dir (the
@@ -2882,11 +3110,11 @@ class Runner:
         r = self.git.run("stash", "push", "-m", message, "--", ".",
                          *([":(exclude)" + self.exclude] if self.exclude else []))
         if r.returncode != 0:
-            warn(f"git stash failed: {(r.stderr or r.stdout).strip()}")
+            self.view.warning(f"git stash failed: {(r.stderr or r.stdout).strip()}")
             return False
         ref = self.git.stash()[:10]
-        say(f"==> set aside as stash@{{0}} ({ref}); `git stash show -p stash@{{0}}` shows it, "
-            f"`git stash pop` brings it back")
+        self.view.note(f"set aside as stash@{{0}} ({ref}); `git stash show -p stash@{{0}}` shows it, "
+                       f"`git stash pop` brings it back")
         self.event("dirty_set_aside", ticket=name, stash=ref)
         append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} {name} - uncommitted edits set aside\n\n"
                                     f"The {phase} step did not finish; its uncommitted edits were stashed "
@@ -2907,7 +3135,7 @@ class Runner:
             if ticket.status() == RUNNABLE:
                 continue  # resumed by the loop
             step = entry.get("phase") if entry.get("phase") in TICKET_PHASES else "implement"
-            say(f"==> {name}: the runner stopped during its {step} step; checking it now")
+            self.view.note(f"{name}: the runner stopped during its {step} step; checking it now")
             failed = self.check_step(step, ticket, entry, None)
             if failed:
                 return self.stop(ticket, step, f"{failed[0]} (checked after an interrupted run)",
@@ -2922,17 +3150,14 @@ class Runner:
         return None
 
     def run_ticket(self, ticket: Ticket) -> int:
-        if UI.live:
-            tickets = self.feature.tickets()
-            done = sum(t.status() == DONE for t in tickets)
-            UI.write("\n" + UI.rule(f"{ticket.number:02d} {ticket.title()}", f"{done}/{len(tickets)} done"))
+        self.view.ticket_started(ticket)
         entry = self.state.ticket(ticket.name)
         resuming = (entry.get("phase") in TICKET_PHASES and entry.get("base")
                     and self.git.is_ancestor(entry["base"]))
         if not resuming:
             if entry.get("phase") in TICKET_PHASES:
-                say(f"==> {ticket.name}: earlier base {str(entry.get('base'))[:10]} is not in "
-                    f"HEAD's history any more; starting the ticket over")
+                self.view.note(f"{ticket.name}: earlier base {str(entry.get('base'))[:10]} is not in "
+                               f"HEAD's history any more; starting the ticket over")
             entry.clear()
             head = self.git.head()
             self.state.update(ticket.name, phase="implement", base=head,
@@ -2949,7 +3174,7 @@ class Runner:
         else:
             if not entry.get("branch"):  # adopted: it runs on whatever branch the run uses
                 self.state.update(ticket.name, branch=self.git.branch())
-            say(f"==> {ticket.name}: resuming at {entry['phase']} (base {entry['base'][:10]})")
+            self.view.note(f"{ticket.name}: resuming at {entry['phase']} (base {entry['base'][:10]})")
 
         pre = self.preflight(ticket.name)
         if pre and STOP.requested:  # Ctrl+C reached the preflight command too
@@ -2978,22 +3203,16 @@ class Runner:
         if code != EXIT_OK:
             return code
         commits = len(self.git.commits(entry["base"]))
-        self.state.update(ticket.name, commits=commits)
+        self.state.update(ticket.name, commits=commits, done_head=self.git.head())
         self.done_this_run.append((ticket.name, time.monotonic() - started, commits))
-        took = fmt_duration(time.monotonic() - started)
-        say(f"==> {ticket.name} done: {commits} commit(s)",
-            live=f"{UI.style('✓', 'green', 'bold')} {UI.style(f'{ticket.number:02d} {ticket.title()}', 'bold')} "
-                 + UI.style(f"done · {commits} commit{'' if commits == 1 else 's'} · {took}", "green"))
+        self.view.ticket_done(ticket, commits, time.monotonic() - started)
         if self.should_pause(ticket) and not entry.get("paused"):
             self.state.update(ticket.name, paused=True)
             self.event("paused", ticket=ticket.name)
             self.notify(self.write_summary("paused", f"after {ticket.name} (pause_after); "
                                                      f"run the same command to continue"))
             self.print_done()
-            if UI.live:
-                UI.write("\n" + "\n".join(UI.box([UI.style(f"⏸ paused after {ticket.name} (pause_after)", "yellow", "bold"),
-                                                  "have a look, then run the same command to continue"],
-                                                 "paused", "yellow")))
+            self.view.paused(ticket)
             return EXIT_PAUSED
         return EXIT_OK
 
@@ -3027,14 +3246,11 @@ class Runner:
             self.triage_new_tickets(unit, entry)
             failed = self.check_step(step, unit, entry, run)
             if failed is None:
-                if UI.live:
-                    self.show_step_result(unit, step, run)
+                self.view.step_passed(unit, step, run.seconds, self.step_commits(unit), run.cost)
                 return self.step_passed(unit, step, run, entry)
             reason, retryable = failed
             failure = reason
-            if UI.live:
-                UI.write(f"  {UI.style('✗', 'red')} {UI.style(f'{step} failed:', 'red', 'bold')} "
-                         f"{reason.splitlines()[0]} {UI.style(fmt_duration(run.seconds), 'gray')}")
+            self.view.step_failed(unit, step, reason, run.seconds)
 
             wait = self.limit_wait(run) if retryable and run.code != 0 else None
             if wait is not None:
@@ -3048,11 +3264,8 @@ class Runner:
                 self.record(unit, step, f"PROVIDER LIMIT - waiting {fmt_duration(wait)}, "
                                         f"until {until:%Y-%m-%d %H:%M}", run, entry["base"])
                 self.event("limit_wait", ticket=unit.name, step=step, seconds=wait)
-                say(f"==> {unit.name}: the provider's limit was hit; waiting until {until:%H:%M}",
-                    live=f"  {UI.style('⏸', 'yellow')} the provider's limit was hit; "
-                         f"waiting until {until:%H:%M}, then the step goes on")
-                with UI.showing(self.waiting_status(f"waiting for the provider's limit "
-                                                    f"(until {until:%H:%M})", time.monotonic() + wait)):
+                self.view.limit_wait(unit, until)
+                with self.view.waiting(f"waiting for the provider's limit (until {until:%H:%M})", wait):
                     self.nap(wait)
                 self.state.set(waiting=None)
                 waited += wait
@@ -3068,11 +3281,8 @@ class Runner:
             self.record(unit, step, f"FAILED, retrying ({attempt}/{attempts - 1}) - {reason}", run,
                         entry["base"])
             delay = self.cfg["retry_delay_seconds"]
-            say(f"==> {unit.name}: {step} failed ({reason}); retrying with a fresh process"
-                + (f" in {fmt_duration(delay)}" if delay else ""),
-                live=f"  {UI.style('↻', 'yellow')} retrying with a fresh process "
-                     f"({attempt}/{attempts - 1})" + (f" in {fmt_duration(delay)}" if delay else ""))
-            with UI.showing(self.waiting_status("retrying soon", time.monotonic() + delay)):
+            self.view.retrying(unit, step, reason, attempt, attempts, delay)
+            with self.view.waiting("retrying soon", delay):
                 self.nap(delay)
             note = self.retry_note(step, reason, run)
 
@@ -3093,12 +3303,19 @@ class Runner:
                 changed.append(f"{t.name} ({t.status() or 'no status'})")
                 t.set_status(NEW_TICKET_STATUS)
         names = ", ".join(t.name for t in new)
-        say(f"==> {unit.name}: new ticket(s) from the agent, left for triage: {names}")
+        self.view.note(f"{unit.name}: new ticket(s) from the agent, left for triage: {names}")
         self.event("new_tickets", ticket=unit.name, new=[t.name for t in new], changed=changed)
         append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} {unit.name} - new tickets: {names}\n\n"
                        f"The agent created them; they are {NEW_TICKET_STATUS} and wait for a human."
                        + (f" Set to {NEW_TICKET_STATUS} by the runner: {', '.join(changed)}." if changed else "")
                        + "\n\n")
+
+    def step_commits(self, unit: Any) -> Optional[int]:
+        """Commits the step just made, for its result line."""
+        try:
+            return len(self.git.commits(self.state.ticket(unit.name).get("step_head") or "HEAD"))
+        except RuntimeError:
+            return None
 
     def step_passed(self, unit: Any, step: str, run: StepRun, entry: Dict[str, Any]) -> int:
         if step == "implement":
@@ -3152,7 +3369,7 @@ class Runner:
             self.event("nothing_runnable", open=[t.name for t in left])
             self.notify(self.write_summary("blocked", f"no runnable ticket, {len(left)} open"))
             self.print_done()
-            print_open(self.feature, left)
+            self.view.blocked(left)
             return EXIT_BLOCKED
         if self.cfg["final_review"]:
             code = self.run_final()
@@ -3164,20 +3381,7 @@ class Runner:
         self.event("all_done", branch=branch)
         self.notify(self.write_summary("done", f"every ticket is done, the work is on branch {branch}"))
         self.print_done()
-        if UI.live:
-            tickets = self.feature.tickets()
-            lines = [UI.style(f"✓ every ticket is done ({len(tickets)})", "green", "bold"),
-                     f"the work is on branch {UI.style(branch, 'bold')} in {UI.path(self.main_git.repo)}", ""]
-            if base_branch:
-                lines += [f"  git log --oneline {base_branch}..{branch}", f"  git diff {base_branch}...{branch}"]
-            lines.append(f"  git push -u origin {branch}  " + UI.style("# when you want it on the server", "gray"))
-            UI.write("\n" + "\n".join(UI.box(lines, "done", "green")))
-            return EXIT_OK
-        say(f"\nThe work is on branch {branch} in {self.main_git.repo}:")
-        if base_branch:
-            say(f"  git log --oneline {base_branch}..{branch}")
-            say(f"  git diff {base_branch}...{branch}")
-        say(f"  git push -u origin {branch}     # when you want it on the server")
+        self.view.finished(branch, base_branch, self.main_git.repo)
         return EXIT_OK
 
     def release_worktree(self) -> None:
@@ -3190,19 +3394,19 @@ class Runner:
         if leftovers:
             msg = (f"keeping the worktree {path}: it has files that are not committed "
                    f"(remove it yourself with `git worktree remove --force {path}`):\n{leftovers}")
-            warn(msg)
+            self.view.warning(msg)
             append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} WORKTREE KEPT\n\n> "
                                         + msg.replace("\n", "\n> ") + "\n\n")
             return
         r = self.main_git.run("worktree", "remove", path)
         if r.returncode != 0:
-            warn(f"could not remove the worktree {path}: {r.stderr.strip()}")
+            self.view.warning(f"could not remove the worktree {path}: {r.stderr.strip()}")
             return
         self.main_git.run("worktree", "prune")
         info["worktree"] = ""
         self.state.save()
         self.event("worktree_removed", path=path)
-        say(f"==> removed the worktree {path}; the branch {info.get('branch')} stays in the repository")
+        self.view.note(f"removed the worktree {path}; the branch {info.get('branch')} stays in the repository")
 
     def feature_base(self) -> str:
         base = self.state.data.get("feature_base", "")
@@ -3224,7 +3428,7 @@ class Runner:
             return EXIT_OK
         base = self.feature_base()
         if not base:
-            say("==> final review skipped: the runner did not do these tickets, so it has no base")
+            self.view.note("final review skipped: the runner did not do these tickets, so it has no base")
             return EXIT_OK
         if entry.get("phase") != "final" or entry.get("base") != base:
             entry.clear()
@@ -3235,29 +3439,12 @@ class Runner:
             return self.stopped_on_request(unit, "final")
         if pre:
             return self.stop(unit, "final", pre, None, base)
-        if UI.live:
-            UI.write("\n" + UI.rule("final review of the whole feature", f"since {base[:10]}", "yellow"))
+        self.view.final_started(base)
         return self.run_step(unit, "final")
 
     def print_done(self) -> None:
-        if not self.done_this_run:
-            return
-        if UI.live:
-            width = max(len(n) for n, _, _ in self.done_this_run)
-            lines = [UI.style("Done in this run", "bold")]
-            for name, seconds, commits in self.done_this_run:
-                lines.append(f"  {UI.style('✓', 'green')} {name.ljust(width)}  "
-                             + UI.style(f"{fmt_duration(seconds)} · {commits} commit{'' if commits == 1 else 's'}",
-                                        "gray"))
-            if self.run_cost:
-                lines.append(UI.style(f"  cost {fmt_cost(self.run_cost)}", "gray"))
-            lines.append(UI.style(f"summary {UI.path(self.summary_path)}", "gray"))
-            UI.write("\n" + "\n".join(lines))
-            return
-        say("\nDone in this run:")
-        for name, seconds, commits in self.done_this_run:
-            say(f"  {name}: {fmt_duration(seconds)}, {commits} commit(s)")
-        say(f"summary: {self.summary_path}")
+        if self.done_this_run:
+            self.view.done_this_run(self.done_this_run, self.run_cost)
 
     # -- housekeeping ------------------------------------------------------
 
@@ -3317,7 +3504,7 @@ class Runner:
                 total -= s
         if removed:
             self.event("logs_rotated", removed=removed)
-            say(f"==> removed {removed} old log file(s)/dir(s) from {self.feature.runs}")
+            self.view.note(f"removed {removed} old log file(s)/dir(s) from {self.feature.runs}")
 
     def interrupt(self) -> None:
         if self.proc is not None:
@@ -3328,25 +3515,354 @@ class Runner:
             pass
 
 
-def print_open(feature: Feature, tickets: List[Ticket]) -> None:
-    index = feature.by_number()
-    if UI.live:
-        lines = [UI.style(f"nothing runnable; {len(tickets)} ticket(s) open", "yellow", "bold")]
-        for t in tickets:
-            why = feature.waiting_on(t, index)
-            extra = f", waiting on {', '.join(why)}" if why and t.status() == RUNNABLE else ""
-            lines.append(f"  {UI.ticket_icon(t.status())} {t.name} {UI.style((t.status() or 'no status') + extra, 'gray')}")
-        UI.write("\n" + "\n".join(UI.box(lines, "blocked", "yellow")))
-        return
-    say("open:")
-    for t in tickets:
-        why = feature.waiting_on(t, index)
-        extra = f", waiting on {', '.join(why)}" if why and t.status() == RUNNABLE else ""
-        say(f"  {t.name} - {t.status() or 'no status'}{extra}")
+# ---------------------------------------------------------------------------
+# The morning report: runs/report.html, one self-contained page built from state.json,
+# REPORT.md and git, so it can be rebuilt at any time (`run-tickets report`).
+
+# "## 2026-10-27 09:05 01-first - implement: ok", "## … STOPPED - reason", "## … WORKTREE KEPT"
+REPORT_ENTRY_RE = re.compile(r"^## (\d{4}-\d\d-\d\d \d\d:\d\d) (.+?)(?: - (.*))?$")
+
+
+def parse_report(text: str) -> List[Dict[str, Any]]:
+    """The entries of REPORT.md: one per step result, stop, new tickets and the like."""
+    entries: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        m = REPORT_ENTRY_RE.match(line)
+        if m:
+            when, name, rest = m.groups()
+            rest = rest or ""
+            step, _, result = rest.partition(": ") if ": " in rest else ("", "", rest)
+            entries.append({"time": when, "name": name, "step": step, "result": result or rest,
+                            "facts": [], "commits": [], "suspicious": [], "quote": [], "_in": ""})
+            continue
+        if not entries:
+            continue
+        e = entries[-1]
+        if line.startswith("> ") or line == ">":
+            e["quote"].append(line[2:])
+        elif line.startswith("  - ") and e["_in"]:
+            e[e["_in"]].append(line[4:])
+        elif line.startswith("- "):
+            fact = line[2:]
+            e["_in"] = ("commits" if fact.startswith("commits since") else
+                        "suspicious" if fact.startswith("**check these test changes**") else "")
+            e["facts"].append(fact)
+        elif line.strip() and not e["facts"]:
+            e["quote"].append(line)  # a free-text entry (new tickets, worktree kept)
+    return entries
+
+
+def entry_kind(entry: Dict[str, Any]) -> str:
+    result = entry["result"]
+    if result.startswith("ok"):
+        return "ok"
+    if result.startswith("FAILED"):
+        return "retry"
+    if result.startswith("PROVIDER LIMIT"):
+        return "wait"
+    if "STOPPED" in result or entry["name"].startswith("STOPPED"):
+        return "stop"
+    return "info"
+
+
+def md_to_html(text: str) -> str:
+    """Markdown as agents write it (headings, lists, checkboxes, code, tables, quotes) to
+    HTML, everything escaped."""
+    out: List[str] = []
+    lines = text.splitlines()
+    i = 0
+    para: List[str] = []
+    lists: List[str] = []
+
+    def end_para() -> None:
+        if para:
+            out.append("<p>" + "<br>".join(md_inline(p) for p in para) + "</p>")
+            para.clear()
+
+    def end_lists() -> None:
+        while lists:
+            out.append(f"</{lists.pop()}>")
+
+    while i < len(lines):
+        line = lines[i]
+        fence = re.match(r"^\s*(`{3,}|~{3,})\s*(\S*)\s*$", line)
+        if fence:
+            end_para()
+            end_lists()
+            body = []
+            i += 1
+            while i < len(lines) and not re.match(rf"^\s*{re.escape(fence.group(1)[0])}{{{len(fence.group(1))},}}\s*$", lines[i]):
+                body.append(lines[i])
+                i += 1
+            out.append(f'<pre><code>{html.escape(chr(10).join(body))}</code></pre>')
+            i += 1
+            continue
+        if Markdown.TABLE_RE.match(line) and i + 1 < len(lines) and Markdown.is_separator(lines[i + 1]):
+            end_para()
+            end_lists()
+            rows = [line]
+            i += 2
+            while i < len(lines) and Markdown.TABLE_RE.match(lines[i]):
+                rows.append(lines[i])
+                i += 1
+            cells = [[md_inline(c.strip()) for c in r.strip().strip("|").split("|")] for r in rows]
+            out.append("<table><thead><tr>" + "".join(f"<th>{c}</th>" for c in cells[0]) + "</tr></thead><tbody>"
+                       + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in cells[1:])
+                       + "</tbody></table>")
+            continue
+        heading = Markdown.HEADING_RE.match(line)
+        task = Markdown.TASK_RE.match(line)
+        bullet = Markdown.BULLET_RE.match(line)
+        ordered = Markdown.ORDERED_RE.match(line)
+        quote = Markdown.QUOTE_RE.match(line)
+        if heading:
+            end_para()
+            end_lists()
+            level = min(len(heading.group(1)) + 2, 6)
+            out.append(f"<h{level}>{md_inline(heading.group(2))}</h{level}>")
+        elif Markdown.RULE_RE.match(line):
+            end_para()
+            end_lists()
+            out.append("<hr>")
+        elif task or bullet or ordered:
+            end_para()
+            tag = "ol" if ordered and not (task or bullet) else "ul"
+            if not lists or lists[-1] != tag:
+                end_lists()
+                out.append(f"<{tag}>")
+                lists.append(tag)
+            if task:
+                done = task.group(2) != " "
+                out.append(f'<li class="task {"done" if done else ""}">{"☑" if done else "☐"} '
+                           f'{md_inline(task.group(3))}</li>')
+            elif bullet:
+                out.append(f"<li>{md_inline(bullet.group(2))}</li>")
+            else:
+                out.append(f"<li>{md_inline(ordered.group(4))}</li>")  # type: ignore[union-attr]
+        elif quote:
+            end_para()
+            end_lists()
+            out.append(f"<blockquote>{md_inline(quote.group(2))}</blockquote>")
+        elif not line.strip():
+            end_para()
+            end_lists()
+        else:
+            end_lists()
+            para.append(line.strip())
+        i += 1
+    end_para()
+    end_lists()
+    return "\n".join(out)
+
+
+def md_inline(text: str) -> str:
+    """Inline markdown to HTML: code, emphasis, links (http and https only)."""
+    codes: List[str] = []
+
+    def hold(m: "re.Match[str]") -> str:
+        codes.append(m.group(2))
+        return f"\ue000{len(codes) - 1}\ue001"
+
+    text = html.escape(re.sub(r"(`+)(.+?)\1", hold, text), quote=False)
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)",
+                  lambda m: f'<a href="{html.escape(m.group(2))}">{m.group(1)}</a>', text)
+    tags = {"bold": "strong", "italic": "em", "strike": "s"}
+    for pattern, style in Markdown.EMPHASIS:
+        text = pattern.sub(lambda m, t=tags[style]: f"<{t}>{m.group(1)}</{t}>", text)
+    return re.sub("\ue000(\\d+)\ue001", lambda m: f"<code>{html.escape(codes[int(m.group(1))])}</code>"
+                  if int(m.group(1)) < len(codes) else m.group(0), text)
+
+
+REPORT_CSS = """
+:root { --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --card: #f6f8fa;
+  --ok: #1a7f37; --retry: #9a6700; --stop: #cf222e; --info: #0969da; --code: #eff1f3; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0;
+  --line: #30363d; --card: #161b22; --ok: #3fb950; --retry: #d29922; --stop: #f85149;
+  --info: #58a6ff; --code: #1f242c; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system,
+  "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 24px; margin: 0 0 4px; } h2 { font-size: 19px; margin: 32px 0 8px; }
+.muted { color: var(--muted); } a { color: var(--info); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 16px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card b { display: block; font-size: 20px; }
+.badge { display: inline-block; border-radius: 999px; padding: 0 8px; font-size: 12px; font-weight: 600;
+  border: 1px solid currentColor; }
+.ok { color: var(--ok); } .retry, .wait { color: var(--retry); } .stop { color: var(--stop); }
+.info { color: var(--info); }
+section.ticket { border: 1px solid var(--line); border-radius: 10px; margin: 16px 0; overflow: hidden; }
+section.ticket > header { background: var(--card); padding: 10px 14px; display: flex; gap: 10px;
+  flex-wrap: wrap; align-items: baseline; }
+section.ticket > header h2 { margin: 0; font-size: 17px; }
+.step { border-top: 1px solid var(--line); padding: 10px 14px; }
+.step.k-retry, .step.k-wait { border-left: 4px solid var(--retry); }
+.step.k-stop { border-left: 4px solid var(--stop); }
+.step > .head { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; color: var(--fg); }
+.step .facts { color: var(--muted); font-size: 13px; }
+details > summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 6px; }
+.agent { border-left: 3px solid var(--line); padding: 0 12px; margin-top: 8px; color: var(--fg); }
+pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 13px; }
+code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: 13px; }
+pre code { padding: 0; background: none; }
+table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
+th, td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+li.task { list-style: none; margin-left: -18px; } li.task.done { color: var(--ok); }
+blockquote { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+ul.commits { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.warn { color: var(--retry); font-size: 13px; }
+"""
+
+
+def write_html_report(feature: Feature, git: Optional[Git] = None) -> Path:
+    """runs/report.html, rebuilt from what the runs left: state.json, REPORT.md, git."""
+    path = feature.runs / "report.html"
+    atomic_write(path, build_html_report(feature, git))
+    return path
+
+
+def build_html_report(feature: Feature, git: Optional[Git] = None) -> str:
+    esc = html.escape
+    data = load_state_data(feature)
+    report_md = feature.runs / "REPORT.md"
+    entries = parse_report(report_md.read_text(encoding="utf-8", errors="replace")) if report_md.exists() else []
+    with feature.snapshot():
+        tickets = feature.tickets()
+        done = sum(t.status() == DONE for t in tickets)
+        index = feature.by_number()
+        tstate = data["tickets"]
+        cost = sum(e.get("cost", 0) for e in tstate.values())
+        seconds = sum(e.get("seconds", 0) for e in tstate.values())
+        info = data.get("outcome") or {}
+        git_info = data.get("git") or {}
+        branch, base_branch = git_info.get("branch", ""), git_info.get("base_branch", "")
+
+        def link(p: str) -> str:
+            """A link to a file of runs/, relative to the page."""
+            try:
+                rel = Path(p).resolve().relative_to(feature.runs.resolve()).as_posix()
+            except (ValueError, OSError):
+                return esc(p)
+            return f'<a href="{esc(rel)}">{esc(rel)}</a>'
+
+        def entry_html(e: Dict[str, Any]) -> str:
+            kind = entry_kind(e)
+            facts = []
+            for f in e["facts"]:
+                m = re.match(r"(log|transcript): (.+)$", f)
+                if m:
+                    facts.append(f"{m.group(1)} {link(m.group(2))}")
+                    continue
+                m = re.match(r"tests: (\w+) \((.+)\)$", f)
+                if m:
+                    facts.append(f"tests {esc(m.group(1).lower())} · {link(m.group(2))}")
+                    continue
+                if f.startswith("**check these test changes**") or f.startswith("commits since"):
+                    continue
+                facts.append(esc(f))
+            parts = [f'<div class="step k-{kind}"><div class="head"><span class="badge {kind}">'
+                     f'{esc(e["step"] or e["name"])}</span><span>{esc(e["result"])}</span>'
+                     f'<span class="muted">{esc(e["time"])}</span></div>']
+            if facts:
+                parts.append(f'<div class="facts">{" · ".join(facts)}</div>')
+            if e["suspicious"]:
+                parts.append('<div class="warn">check these test changes (skips, ignores, changed constants):'
+                             "<ul>" + "".join(f"<li>{md_inline(c)}</li>" for c in e["suspicious"]) + "</ul></div>")
+            if e["quote"]:
+                body = md_to_html("\n".join(e["quote"]))
+                parts.append(f'<details open><summary>the agent\'s report</summary><div class="agent">{body}</div></details>'
+                             if e["step"] else f'<div class="agent">{body}</div>')
+            parts.append("</div>")
+            return "".join(parts)
+
+        def changes(name: str, entry: Dict[str, Any]) -> str:
+            """The unit's commits (as its last step saw them) and the files they changed."""
+            commits = next((e["commits"] for e in reversed(by_name.get(name, [])) if e["commits"]), [])
+            out = []
+            if commits:
+                out.append(f'<details open><summary>{len(commits)} commit{"" if len(commits) == 1 else "s"}</summary>'
+                           '<ul class="commits">' + "".join(f"<li>{esc(c)}</li>" for c in commits) + "</ul></details>")
+            if git is not None and entry.get("base") and entry.get("done_head"):
+                r = git.run("diff", "--stat=100", entry["base"], entry["done_head"])
+                if r.returncode == 0 and r.stdout.strip():
+                    out.append(f"<details><summary>files changed</summary><pre>{esc(r.stdout.rstrip())}</pre></details>")
+            return f'<div class="step">{"".join(out)}</div>' if out else ""
+
+        by_name: Dict[str, List[Dict[str, Any]]] = {}
+        for e in entries:
+            by_name.setdefault(e["name"], []).append(e)
+
+        sections = []
+        for t in tickets + ([FinalUnit(feature)] if FINAL in tstate or FINAL in by_name else []):
+            final = t.name == FINAL
+            st = tstate.get(t.name) or {}
+            status = st.get("phase", "not started") if final else t.status() or "no status"
+            kind = ("ok" if status == DONE else "stop" if st.get("last_stop") and st.get("phase") != "done"
+                    else "info")
+            head = [f'<span class="badge {kind}">{esc(status)}</span>',
+                    f"<h2>{esc('final review of the whole feature' if final else f'{t.number:02d} {t.title()}')}</h2>"]
+            if not final:
+                total = t.checked() + t.unchecked()
+                if total:
+                    head.append(f'<span class="muted">{t.checked()}/{total} criteria</span>')
+                why = feature.waiting_on(t, index)
+                if why and t.status() not in CLOSED:
+                    head.append(f'<span class="muted">waiting on {esc(", ".join(why))}</span>')
+            bits = []
+            if st.get("seconds"):
+                bits.append(fmt_duration(st["seconds"]))
+            if st.get("commits") is not None:
+                bits.append(f"{st['commits']} commit{'' if st['commits'] == 1 else 's'}")
+            if st.get("cost"):
+                bits.append(fmt_cost(st["cost"]))
+            if bits:
+                head.append(f'<span class="muted">{" · ".join(bits)}</span>')
+            body = "".join(entry_html(e) for e in by_name.get(t.name, []))
+            if not body:
+                body = '<div class="step"><span class="muted">not run yet</span></div>'
+            sections.append(f'<section class="ticket" id="{esc(t.name)}"><header>{"".join(head)}</header>'
+                            f"{body}{changes(t.name, st)}</section>")
+
+        units = {t.name for t in tickets} | {FINAL}
+        run_events = "".join(entry_html(e) for e in entries if e["name"] not in units)
+
+    outcome = info.get("outcome") or ("done" if tickets and done == len(tickets) else "in progress")
+    okind = {"done": "ok", "stopped": "stop", "blocked": "retry", "paused": "retry"}.get(outcome, "info")
+    title = feature.spec_title()
+    cards = [("tickets done", f"{done}/{len(tickets)}"), ("agent time", fmt_duration(seconds)),
+             ("cost", fmt_cost(cost) if cost else "not reported"),
+             ("branch", branch or "the current one")]
+    commands = ""
+    if branch and base_branch:
+        commands = (f"<pre>git log --oneline {esc(base_branch)}..{esc(branch)}\n"
+                    f"git diff {esc(base_branch)}...{esc(branch)}</pre>")
+    page = [
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>{esc(feature.name)} · run-tickets</title><style>{REPORT_CSS}</style></head><body><main>",
+        f"<h1>{esc(feature.name)}</h1>",
+        f'<div class="muted">{esc(title) if title != feature.name else ""}</div>',
+        f'<p><span class="badge {okind}">{esc(outcome)}</span> {esc(info.get("detail", ""))} '
+        f'<span class="muted">· updated {esc((info.get("time") or iso())[:16].replace("T", " "))} '
+        f'· run-tickets {__version__}</span></p>',
+        '<div class="cards">' + "".join(f'<div class="card"><span class="muted">{esc(k)}</span><b>{esc(v)}</b></div>'
+                                       for k, v in cards) + "</div>",
+        commands,
+        *sections,
+        (f"<h2>Run events</h2>{run_events}" if run_events else ""),
+        f'<p class="muted">Built from runs/state.json, <a href="REPORT.md">REPORT.md</a> and git; '
+        f"<code>run-tickets report {esc(str(feature.dir))}</code> rebuilds it.</p>",
+        "</main></body></html>",
+    ]
+    return "\n".join(p for p in page if p)
 
 
 # ---------------------------------------------------------------------------
 # Commands
+
+
+RUN_FILES = (("SUMMARY.md", "summary"), ("REPORT.md", "report"), ("report.html", "html report"))
 
 
 def load_state_data(feature: Feature) -> Dict[str, Any]:
@@ -3385,140 +3901,185 @@ def running_lines(feature: Feature, data: Dict[str, Any]) -> Tuple[List[str], bo
     return out, running
 
 
-def status_text(feature: Feature) -> List[str]:
-    data = load_state_data(feature)
+@dataclasses.dataclass
+class TicketRow:
+    """One ticket as `status` and the head of a run show it."""
+    ticket: Ticket
+    status: str  # "" when the ticket has none
+    checked: int
+    total: int  # criteria
+    waiting_on: List[str]  # "03-third (ready-for-agent)"; only for open tickets
+    phase: str  # where the runner is with it, "" when nowhere
+    interrupted: bool
+    stop_time: str
+    stop_reason: str  # the first line
+    step_now: str  # the step running now, "" when it is not the current ticket
+    shared_number: int  # tickets with its number, when it is the first of several
+
+
+@dataclasses.dataclass
+class StatusModel:
+    """What `status` shows, once: status_text and status_live format it."""
+    feature: Feature
+    now_lines: List[str]
+    running: bool
+    branch: str
+    worktree: str
+    rows: List[TicketRow]
+    final: Optional[Dict[str, str]]  # {"phase", "stop_time", "stop_reason"}
+    next_name: str  # "" when none is runnable
+    done: int
+    cost: float
+    files: List[Tuple[str, Path]]  # (label, path) of the run's files that exist
+
+
+def status_model(feature: Feature, data: Optional[Dict[str, Any]] = None) -> StatusModel:
+    """The feature's state from its ticket files and state.json. With `data` (the run's own
+    state, at its start) the lock and the current step are not looked at."""
+    if data is None:
+        data = load_state_data(feature)
+        now_lines, running = running_lines(feature, data)
+    else:
+        now_lines, running = [], False
     index = feature.by_number()
     tickets = feature.tickets()
-    out = [f"{feature.dir}"]
-    now_lines, running = running_lines(feature, data)
-    out += now_lines
-    git_info = data.get("git") or {}
-    if git_info.get("branch"):
-        out.append(f"branch: {git_info['branch']}" + (f", worktree {git_info['worktree']}" if git_info.get("worktree") else ""))
+    cur = (data.get("current") or {}) if running else {}
+    rows = []
     for t in tickets:
-        status = t.status() or "no status"
-        mark = {"done": "x", "wontfix": "-"}.get(status, " ")
-        line = f"  [{mark}] {t.name} - {status}"
-        if t.status() not in CLOSED:
-            total = t.checked() + t.unchecked()
-            if total:
-                line += f", {t.checked()}/{total} criteria"
-            why = feature.waiting_on(t, index)
-            if why:
-                line += f", waiting on {', '.join(why)}"
         entry = data["tickets"].get(t.name) or {}
-        if entry.get("phase") in TICKET_PHASES:
-            line += f"\n        runner: at {entry['phase']}" + (" (interrupted)" if entry.get("running") and not running else "")
-            if entry.get("last_stop"):
-                line += f", stopped {entry['last_stop'].get('time')}: {entry['last_stop'].get('reason', '').splitlines()[0]}"
-        out.append(line)
-        if len(index.get(t.number, [])) > 1 and t is index[t.number][0]:
-            out.append(f"      warning: {len(index[t.number])} tickets share number {t.number:02d}")
+        stop = entry.get("last_stop") or {}
+        in_phase = entry.get("phase") in TICKET_PHASES
+        same = index.get(t.number, [])
+        rows.append(TicketRow(
+            ticket=t, status=t.status(), checked=t.checked(), total=t.checked() + t.unchecked(),
+            waiting_on=feature.waiting_on(t, index) if t.status() not in CLOSED else [],
+            phase=entry["phase"] if in_phase else "",
+            interrupted=bool(in_phase and entry.get("running") and not running),
+            stop_time=str(stop.get("time")) if in_phase and stop else "",
+            stop_reason=stop.get("reason", "").splitlines()[0] if in_phase and stop else "",
+            step_now=str(cur.get("step")) if cur.get("ticket") == t.name else "",
+            shared_number=len(same) if len(same) > 1 and t is same[0] else 0))
     fe = data["tickets"].get(FINAL)
+    final = None
     if fe:
-        line = f"  final review: {fe.get('phase')}"
-        if fe.get("last_stop") and fe.get("phase") != "done":
-            line += f", stopped {fe['last_stop'].get('time')}: {fe['last_stop'].get('reason', '').splitlines()[0]}"
-        out.append(line)
+        stop = fe.get("last_stop") if fe.get("phase") != "done" else None
+        final = {"phase": str(fe.get("phase")),
+                 "stop_time": str(stop.get("time")) if stop else "",
+                 "stop_reason": stop.get("reason", "").splitlines()[0] if stop else ""}
+    git_info = data.get("git") or {}
     nxt = feature.next_ticket()
-    out.append(f"next: {nxt.name if nxt else 'none runnable'}")
-    done = sum(1 for t in tickets if t.status() == DONE)
-    cost = sum(e.get("cost", 0) for e in data["tickets"].values())
-    out.append(f"done: {done}/{len(tickets)}" + (f", cost so far {fmt_cost(cost)}" if cost else ""))
-    for name in ("SUMMARY.md", "REPORT.md"):
-        if (feature.runs / name).exists():
-            out.append(f"{name.split('.')[0].lower()}: {feature.runs / name}")
+    return StatusModel(
+        feature=feature, now_lines=now_lines, running=running,
+        branch=git_info.get("branch") or "", worktree=git_info.get("worktree") or "",
+        rows=rows, final=final, next_name=nxt.name if nxt else "",
+        done=sum(1 for t in tickets if t.status() == DONE),
+        cost=sum(e.get("cost", 0) for e in data["tickets"].values()),
+        files=[(label, feature.runs / name) for name, label in RUN_FILES if (feature.runs / name).exists()])
+
+
+def status_text(model: StatusModel) -> List[str]:
+    out = [f"{model.feature.dir}", *model.now_lines]
+    if model.branch:
+        out.append(f"branch: {model.branch}" + (f", worktree {model.worktree}" if model.worktree else ""))
+    for r in model.rows:
+        status = r.status or "no status"
+        mark = {"done": "x", "wontfix": "-"}.get(status, " ")
+        line = f"  [{mark}] {r.ticket.name} - {status}"
+        if r.status not in CLOSED:
+            if r.total:
+                line += f", {r.checked}/{r.total} criteria"
+            if r.waiting_on:
+                line += f", waiting on {', '.join(r.waiting_on)}"
+        if r.phase:
+            line += f"\n        runner: at {r.phase}" + (" (interrupted)" if r.interrupted else "")
+            if r.stop_time:
+                line += f", stopped {r.stop_time}: {r.stop_reason}"
+        out.append(line)
+        if r.shared_number:
+            out.append(f"      warning: {r.shared_number} tickets share number {r.ticket.number:02d}")
+    if model.final:
+        line = f"  final review: {model.final['phase']}"
+        if model.final["stop_time"]:
+            line += f", stopped {model.final['stop_time']}: {model.final['stop_reason']}"
+        out.append(line)
+    out.append(f"next: {model.next_name or 'none runnable'}")
+    out.append(f"done: {model.done}/{len(model.rows)}" + (f", cost so far {fmt_cost(model.cost)}" if model.cost else ""))
+    out += [f"{label}: {path}" for label, path in model.files]
     return out
 
 
-def live_header(feature: Feature, data: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None) -> List[str]:
+def live_header(model: StatusModel, cfg: Optional[Dict[str, Any]] = None) -> List[str]:
     """The box at the top of a run and of `status`: the feature, the agent, the branch."""
-    git_info = data.get("git") or {}
+    feature = model.feature
     title = feature.spec_title()
     lines = [UI.style(feature.name, "bold") + (UI.style(f"  {title}", "gray") if title != feature.name else "")]
     bits = []
     if cfg:
         bits.append(f"agent {UI.style(cfg['agent'], 'cyan')}")
-    if git_info.get("branch"):
-        bits.append(f"branch {UI.style(git_info['branch'], 'cyan')}")
-    if git_info.get("worktree"):
-        bits.append(f"worktree {UI.path(git_info['worktree'])}")
+    if model.branch:
+        bits.append(f"branch {UI.style(model.branch, 'cyan')}")
+    if model.worktree:
+        bits.append(f"worktree {UI.path(model.worktree)}")
     if cfg and cfg.get("config_path"):
         bits.append(UI.style(f"config {UI.path(cfg['config_path'])}", "gray"))
     if bits:
         lines.append(UI.style(" · ", "gray").join(bits))
-    tickets = feature.tickets()
-    done = sum(t.status() == DONE for t in tickets)
-    cost = sum(e.get("cost", 0) for e in data["tickets"].values())
-    lines.append(f"{UI.bar(done, len(tickets), 24)} {done}/{len(tickets)} done"
-                 + (UI.style(f" · cost so far {fmt_cost(cost)}", "gray") if cost else ""))
+    lines.append(f"{UI.bar(model.done, len(model.rows), 24)} {model.done}/{len(model.rows)} done"
+                 + (UI.style(f" · cost so far {fmt_cost(model.cost)}", "gray") if model.cost else ""))
     return UI.box(lines, f"run-tickets {__version__}", "cyan")
 
 
-def live_ticket_rows(feature: Feature, data: Dict[str, Any], running: bool = False) -> List[str]:
+def live_ticket_rows(model: StatusModel) -> List[str]:
     """A line per ticket: an icon, the number, the title, what holds it."""
-    index = feature.by_number()
-    tickets = feature.tickets()
-    cur = (data.get("current") or {}).get("ticket") if running else None
-    width = min(max([visible_len(t.title()) for t in tickets] + [0]), 44)
+    width = min(max([visible_len(r.ticket.title()) for r in model.rows] + [0]), 44)
     rows = []
-    for t in tickets:
-        status = t.status() or "no status"
+    for r in model.rows:
+        t, status = r.ticket, r.status or "no status"
         detail = []
-        if t.status() not in CLOSED:
+        if r.status not in CLOSED:
             if status != RUNNABLE:
                 detail.append(UI.style(status, "yellow"))
-            total = t.checked() + t.unchecked()
-            if total:
-                detail.append(f"{t.checked()}/{total} criteria")
+            if r.total:
+                detail.append(f"{r.checked}/{r.total} criteria")
             # "03-third (ready-for-agent)" -> "03": the row above or below says the rest.
-            why = [re.sub(r"^(\d+)-\S+ \(.*\)$", r"\1", w) for w in feature.waiting_on(t, index)]
+            why = [re.sub(r"^(\d+)-\S+ \(.*\)$", r"\1", w) for w in r.waiting_on]
             if why:
                 detail.append(f"waiting on {', '.join(why)}")
         elif status == "wontfix":
             detail.append("wontfix")
-        entry = data["tickets"].get(t.name) or {}
-        if entry.get("phase") in TICKET_PHASES and t.name != cur:
-            interrupted = entry.get("running") and not running
-            detail.append(UI.style(f"at {entry['phase']}" + (" (interrupted)" if interrupted else ""), "cyan"))
-            stop = entry.get("last_stop")
-            if stop:
-                detail.append(UI.style(f"stopped: {stop.get('reason', '').splitlines()[0]}", "red"))
-        elif t.name == cur:
-            detail.append(UI.style(f"{(data.get('current') or {}).get('step')} now", "yellow"))
+        if r.phase and not r.step_now:
+            detail.append(UI.style(f"at {r.phase}" + (" (interrupted)" if r.interrupted else ""), "cyan"))
+            if r.stop_time:
+                detail.append(UI.style(f"stopped: {r.stop_reason}", "red"))
+        elif r.step_now:
+            detail.append(UI.style(f"{r.step_now} now", "yellow"))
         title = clip(t.title(), width)
         title += " " * (width - visible_len(title))
-        row = (f"  {UI.ticket_icon(t.status(), t.name == cur)} {UI.style(f'{t.number:02d}', 'gray')} "
+        row = (f"  {UI.ticket_icon(r.status, bool(r.step_now))} {UI.style(f'{t.number:02d}', 'gray')} "
                f"{title}  " + UI.style(" · ", "gray").join(UI.style(d, "gray") if "\x1b" not in d else d
                                                           for d in detail))
         rows.append(clip(row, UI.width() - 1))
-        if len(index.get(t.number, [])) > 1 and t is index[t.number][0]:
-            rows.append(UI.style(f"     warning: {len(index[t.number])} tickets share number {t.number:02d}",
+        if r.shared_number:
+            rows.append(UI.style(f"     warning: {r.shared_number} tickets share number {t.number:02d}",
                                  "yellow"))
     return rows
 
 
-def status_live(feature: Feature) -> List[str]:
-    data = load_state_data(feature)
-    now_lines, running = running_lines(feature, data)
-    out = live_header(feature, data)
-    for i, line in enumerate(now_lines):
+def status_live(model: StatusModel) -> List[str]:
+    out = live_header(model)
+    for i, line in enumerate(model.now_lines):
         out.append(UI.style(line, "gray") if i else
-                   UI.style("● " if running else "○ ", "yellow" if running else "gray") + line)
-    out += live_ticket_rows(feature, data, running)
-    fe = data["tickets"].get(FINAL)
-    if fe:
-        line = (f"  {UI.ticket_icon(DONE if fe.get('phase') == 'done' else RUNNABLE)} "
-                f"{UI.style('··', 'gray')} final review  {UI.style(str(fe.get('phase')), 'gray')}")
-        if fe.get("last_stop") and fe.get("phase") != "done":
-            line += UI.style(f" · stopped: {fe['last_stop'].get('reason', '').splitlines()[0]}", "red")
+                   UI.style("● " if model.running else "○ ", "yellow" if model.running else "gray") + line)
+    out += live_ticket_rows(model)
+    if model.final:
+        line = (f"  {UI.ticket_icon(DONE if model.final['phase'] == 'done' else RUNNABLE)} "
+                f"{UI.style('··', 'gray')} final review  {UI.style(model.final['phase'], 'gray')}")
+        if model.final["stop_time"]:
+            line += UI.style(f" · stopped: {model.final['stop_reason']}", "red")
         out.append(line)
-    nxt = feature.next_ticket()
     out.append("")
-    out.append(f"next {UI.style(nxt.name, 'bold') if nxt else UI.style('none runnable', 'yellow')}")
-    for name in ("SUMMARY.md", "REPORT.md"):
-        if (feature.runs / name).exists():
-            out.append(UI.style(f"{name.split('.')[0].lower()} {UI.path(feature.runs / name)}", "gray"))
+    out.append(f"next {UI.style(model.next_name, 'bold') if model.next_name else UI.style('none runnable', 'yellow')}")
+    out += [UI.style(f"{label} {UI.path(path)}", "gray") for label, path in model.files]
     return out
 
 
@@ -3536,7 +4097,7 @@ def cmd_status(feature: Feature, watch: Optional[float]) -> int:
 
     def render(f: Feature) -> List[str]:
         with f.snapshot():
-            return view(f)
+            return view(status_model(f))
 
     if not watch:
         for line in render(feature):
@@ -3555,6 +4116,20 @@ def cmd_status(feature: Feature, watch: Optional[float]) -> int:
             time.sleep(watch)
     except KeyboardInterrupt:
         return EXIT_OK
+
+
+def cmd_report(feature: Feature, open_it: bool) -> int:
+    if not feature.runs.exists():
+        raise UsageError(f"{feature.dir} has not been run yet: no runs/ directory")
+    try:
+        git: Optional[Git] = Git(feature.dir)
+    except UsageError:
+        git = None
+    path = write_html_report(feature, git)
+    say(str(path))
+    if open_it:
+        webbrowser.open(path.resolve().as_uri())
+    return EXIT_OK
 
 
 def cmd_init(target: Optional[str], agent: Optional[str]) -> int:
@@ -3752,6 +4327,7 @@ HELP_EPILOG = """examples:
   run-tickets reset  .scratch/my-feature 05   # do 05 again from scratch
   run-tickets skip   .scratch/my-feature 05 --reason "covered by 06"
   run-tickets adopt  .scratch/my-feature --feature-base abc123 --resume 16:review:def456
+  run-tickets report .scratch/my-feature --open  # the morning report in the browser
 
 The feature dir can be given from anywhere; the runner works in the git repo that
 contains it. Config: --config, else .ticket-runner.toml in the feature dir, else in
@@ -3760,7 +4336,7 @@ exit codes: 0 all done, 1 stopped, 2 usage/setup error, 3 open tickets left,
 4 paused, 130 interrupted
 """
 
-COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip", "adopt")
+COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip", "adopt", "report")
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -3826,6 +4402,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         t.add_argument("feature")
         t.add_argument("ticket", help="number (05), name (05-slug), or 'final' for the final review")
         t.add_argument("--reason", default="", help="why (written to the ticket's Comments)")
+
+    rp = sub.add_parser("report", help="write runs/report.html: the whole run on one page")
+    rp.add_argument("feature")
+    rp.add_argument("--open", action="store_true", help="open it in the browser")
 
     a = sub.add_parser("adopt", help="take over a feature another runner started")
     a.add_argument("feature")
@@ -3927,6 +4507,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_config(Feature(Path(args.feature)), args)
         if args.command == "adopt":
             return cmd_adopt(Feature(Path(args.feature)), args.feature_base, args.resume)
+        if args.command == "report":
+            return cmd_report(Feature(Path(args.feature)), args.open)
         if args.command in ("retry", "reset", "skip"):
             return cmd_ticket(Feature(Path(args.feature)), args.command, args.ticket, args.reason)
         if args.dry_run:

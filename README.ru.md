@@ -22,6 +22,9 @@
 репозитории появляется ветка с коммитами, а пушить её или нет, решаете вы. Если раннер упал,
 его можно запустить снова, и он продолжит с того же шага.
 
+Зачем это нужно, если агент может сам, — подробнее и чтобы поделиться:
+[docs/why.ru.md](https://github.com/omanei/run-tickets/blob/master/docs/why.ru.md).
+
 ```
  следующий тикет ─▶ implement ─▶ проверки + тесты ─▶ review ─▶ проверки + тесты ─▶ done
         ▲              │ провал: повтор │ лимит провайдера: ждать           │
@@ -57,8 +60,8 @@ run-tickets config .scratch/my-feature --prompts
 run-tickets run .scratch/my-feature
 ```
 
-Утром достаточно открыть `.scratch/my-feature/runs/SUMMARY.md` или выполнить
-`run-tickets status .scratch/my-feature`.
+Утром выполните `run-tickets report .scratch/my-feature --open`: весь прогон на одной
+странице. `run-tickets status .scratch/my-feature` показывает то же в терминале.
 
 **Попробовать без модели:** склонируйте репозиторий и выполните `python examples/demo.py`.
 Демо создаёт временный git-репозиторий с примером фичи (`examples/demo`: спека и три тикета)
@@ -119,6 +122,7 @@ run-tickets retry  <feature> 05             # повторить шаг, на к
 run-tickets reset  <feature> 05             # сделать 05 заново с нуля
 run-tickets skip   <feature> 05 --reason …  # пометить 05 как wontfix с комментарием
 run-tickets adopt  <feature> --feature-base <sha> [--resume 16:review:<sha>]  # перенять фичу
+run-tickets report <feature> [--open]       # runs/report.html: весь прогон на одной странице
 run-tickets init   [--agent claude]         # создать .ticket-runner.toml в корне репозитория
 ```
 
@@ -214,6 +218,102 @@ max_cost = 50                       # долларов за ночь (агент
 protected = ["migrations/", ".github/"]
 notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
 ```
+
+Готовые конфиги для каждого агента и для частых случаев лежат в
+[`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs).
+
+## Рецепты
+
+Короткие конфиги под частые устройства проекта. Каждый блок — фрагмент `.ticket-runner.toml`:
+добавьте к нему агента и остальные настройки, а результат проверьте командой
+`run-tickets config <папка фичи>`.
+
+### Тесты в Docker
+
+Если тестам нужны база или другие сервисы, пусть их гоняет свежий контейнер из рабочей копии
+раннера:
+
+```toml
+test_command = "docker compose run --rm app pytest -q"
+preflight = ["docker info"]          # Docker не запущен — стоп до старта агента
+```
+
+`docker compose run` читает compose-файл из рабочей копии, поэтому bind mount на `.`
+монтирует код, который только что написал агент. Так работает и с `worktree = true`. С
+долгоживущим контейнером иначе. Если тесты идут в контейнере, запущенном из основной копии
+(`docker compose exec app pytest`), он видит код вашей копии. В worktree изменения агента
+вообще не проверялись бы. Тогда оставьте `worktree = false`:
+
+```toml
+branch = "feat/{{feature}}"
+worktree = false                     # контейнер смонтирован на эту копию
+test_command = "docker compose exec -T app pytest -q"   # -T: у раннера нет терминала
+preflight = ["docker compose ps --status running --services | grep -q app"]
+```
+
+### Монорепозиторий, где меняется один пакет
+
+```toml
+test_command = "cd packages/api && npm test"   # запускается из корня репозитория
+extra_instructions = "This feature changes only packages/api. Do not edit other packages."
+protected = ["packages/web/"]        # агент тронул — раннер останавливается
+```
+
+Команды выполняются в корне рабочей копии. Если фичи трогают разные пакеты, положите конфиг в
+папку каждой фичи. Он важнее конфига в корне репозитория, а файлы не сливаются, так что в нём
+должен быть весь конфиг.
+
+### Node или Python в worktree
+
+В новом worktree есть только файлы под git. `worktree_setup` один раз, до первого шага,
+доносит остальное: `.env` из вашей копии (`$RUN_TICKETS_MAIN_REPO`) и зависимости. Если
+настройка упала, запуск останавливается, а в следующий раз она повторяется.
+
+```toml
+# Node
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "npm ci"]
+test_command = "npm test"
+```
+
+```toml
+# Python с uv
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "uv sync"]
+test_command = "uv run pytest -q"
+```
+
+### Уведомления в Slack или Telegram
+
+`notify_command` запускается при остановке, паузе и в конце, текст в одну строку — в
+`$RUN_TICKETS_MESSAGE`. Токены берутся из окружения, в котором запущен раннер.
+
+```toml
+# Slack: incoming webhook
+notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
+```
+
+```toml
+# Telegram: токен бота от @BotFather и id вашего чата
+notify_command = 'curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" --data-urlencode text="$RUN_TICKETS_MESSAGE"'
+```
+
+### Несколько фич за один запуск
+
+```bash
+run-tickets run .scratch/feat-a .scratch/feat-b --keep-going
+```
+
+```toml
+branch = "feat/{{feature}}"          # своя ветка на фичу
+worktree = true                      # каждая ветка начинается от коммита вашей копии
+```
+
+Фичи идут одна за другой, у каждой своё состояние, ветка и сводка. Остановка или пауза
+заканчивают запуск на этой фиче, а с `--keep-going` раннер переходит к следующей. С
+`worktree = true` ветки независимы. Без worktree ваша копия к старту feat-b ещё стоит на
+ветке feat-a, и ветка feat-b растёт из неё. Это то, что нужно, когда feat-b опирается на
+feat-a.
 
 ## Возможности
 
@@ -374,6 +474,9 @@ model = "opus"
 Файлы не сливаются: раннер берёт первый найденный.
 
 - `run-tickets init` создаёт файл, где все ключи с умолчаниями закомментированы и объяснены.
+- В [`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs)
+  лежат готовые конфиги для каждого агента и для частых случаев, а в [Рецептах](#рецепты) —
+  фрагменты для Docker, монорепозитория, worktree и уведомлений.
 - `run-tickets config <feature>` показывает, какой файл подхватился, откуда взялось каждое
   значение и какой командой будет запущен агент на каждом шаге.
 - Если в конфиге опечатка в ключе, раннер не запустится, а не проигнорирует её молча.
@@ -555,8 +658,17 @@ Implement без коммитов не провал: его результат �
 
 ## Что смотреть утром
 
+Начните с **`runs/report.html`**: весь прогон на одной странице, сделанной для утра. Сверху
+итог, время и стоимость, ветка и команды, чтобы посмотреть работу. Ниже раздел на каждый
+тикет и на финальное ревью. У каждого шага видно, чем он закончился, сколько шёл, есть
+ссылки на его лог и лог тестов и отчёт агента, отрисованный из markdown. Повторы и
+остановки выделены, ниже коммиты тикета и изменённые файлы. Это один файл без доступа в сеть.
+Раннер переписывает его после каждого тикета, а `run-tickets report <фича> --open` в любой
+момент пересобирает и открывает.
+
 | Файл | Что там |
 |---|---|
+| `runs/report.html` | страница, описанная выше |
 | `runs/SUMMARY.md` | итог: сколько сделано, где встал и почему, стоимость, ветка, таблица по тикетам |
 | `runs/REPORT.md` | по записи на шаг: результат или причина остановки, длительность, стоимость, тесты, коммиты, подозрительные изменения тестов, отчёт модели |
 | `runs/<тикет>-<шаг>-<время>.log` | полный вывод агента (у `claude` весь поток событий) |
@@ -648,6 +760,10 @@ python -m pytest
 - демо из `examples/`.
 
 CI (`.github/workflows/test.yml`) гоняет тесты на Linux, macOS и Windows с Python 3.9 и 3.13.
+
+В [CONTRIBUTING.md](https://github.com/omanei/run-tickets/blob/master/CONTRIBUTING.md)
+(по-английски) — правила кода (один файл, Python 3.9, простой вывод как стабильный
+интерфейс) и шаги для добавления пресета агента.
 
 GIF в начале README записан с настоящего прогона демо в псевдотерминале:
 `python examples/record_demo.py` (Linux или macOS; нужны `pillow` и `pyte`).

@@ -1,0 +1,21 @@
+# A cheaper model writes the code, a stronger one reviews each ticket and the whole
+# feature. The review fixes what it finds and ticks the criteria, so most of the
+# quality comes from it, and most of the tokens are spent in implement.
+
+agent = "claude"
+test_command = "make test"
+branch = "feat/{{feature}}"
+
+[steps.implement]
+model = "sonnet"
+
+[steps.review]                # verify, the check of a ticket without commits, takes these too
+model = "opus"
+
+[steps.final]
+model = "opus"
+max_time = "1h"
+
+# A review by another tool catches what the author's model missed:
+# [steps.review]
+# agent = "codex"

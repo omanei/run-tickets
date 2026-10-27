@@ -42,6 +42,9 @@ the agent that doesn't trust any of that:
   process tree, and in the morning a summary says what was done, where it stopped and why.
 - **Local only.** The result is a branch in your repository; pushing it is up to you.
 
+The longer version, to read or to share:
+[Why a runner, if the agent can do it itself](https://github.com/omanei/run-tickets/blob/master/docs/why.md).
+
 It works on **Linux, macOS and Windows** with Python 3.9+ and git. The installer brings the
 one library it uses, `rich`, for highlighted code and tables; a copied file runs without it.
 It drives **Claude Code, Codex, omp, pi, Gemini CLI, Qwen Code, opencode, Kilo, Cursor, Amp,
@@ -62,8 +65,8 @@ run-tickets config .scratch/my-feature --prompts
 run-tickets run .scratch/my-feature
 ```
 
-In the morning, open `.scratch/my-feature/runs/SUMMARY.md` or run
-`run-tickets status .scratch/my-feature`.
+In the morning, run `run-tickets report .scratch/my-feature --open`: the whole run on one
+page. `run-tickets status .scratch/my-feature` shows the same in the terminal.
 
 **Try it without a model:** clone this repository and run `python examples/demo.py`. It
 creates a throwaway git repository with an example feature (`examples/demo`: a spec and three
@@ -142,6 +145,7 @@ run-tickets retry  <feature> 05             # rerun the step ticket 05 stopped a
 run-tickets reset  <feature> 05             # do 05 again from scratch
 run-tickets skip   <feature> 05 --reason …  # mark 05 wontfix with a comment
 run-tickets adopt  <feature> --feature-base <sha> [--resume 16:review:<sha>]  # take over a feature
+run-tickets report <feature> [--open]       # runs/report.html: the whole run on one page
 run-tickets init   [--agent claude]         # write .ticket-runner.toml in the repo root
 ```
 
@@ -235,6 +239,102 @@ max_cost = 50                       # USD per run (agents that report cost)
 protected = ["migrations/", ".github/"]
 notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
 ```
+
+More ready-made configs, one per agent and for common setups, are in
+[`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs).
+
+## Recipes
+
+Short configs for common project shapes. Each block is a fragment of a `.ticket-runner.toml`;
+combine it with the agent and the rest of your settings, then check the result with
+`run-tickets config <feature dir>`.
+
+### Tests in Docker
+
+When the tests need a database or other services, let a fresh container run them from the
+runner's working tree:
+
+```toml
+test_command = "docker compose run --rm app pytest -q"
+preflight = ["docker info"]          # no Docker daemon: stop before an agent starts
+```
+
+`docker compose run` reads the compose file in the working tree, so a bind mount of `.`
+mounts the code the agent just wrote, and this works with `worktree = true` too. A
+long-lived container is different. If the tests run in one that was started from your main
+checkout (`docker compose exec app pytest`), it sees your checkout's code. In a worktree, the
+agent's changes would not be tested at all. Keep `worktree = false` then:
+
+```toml
+branch = "feat/{{feature}}"
+worktree = false                     # the container mounts this checkout
+test_command = "docker compose exec -T app pytest -q"   # -T: the runner has no terminal
+preflight = ["docker compose ps --status running --services | grep -q app"]
+```
+
+### A monorepo where one package changes
+
+```toml
+test_command = "cd packages/api && npm test"   # run from the repository root
+extra_instructions = "This feature changes only packages/api. Do not edit other packages."
+protected = ["packages/web/"]        # the agent touching it stops the run
+```
+
+The commands run in the root of the working tree. When features touch different packages,
+put a config in each feature's directory. It wins over the one in the repository root, and
+the files are not merged, so it holds the whole config.
+
+### Node or Python in a worktree
+
+A new worktree has only tracked files. `worktree_setup` brings in the rest once, before the
+first step: `.env` from your checkout (`$RUN_TICKETS_MAIN_REPO`), the dependencies. A failed
+setup stops the run and is repeated on the next one.
+
+```toml
+# Node
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "npm ci"]
+test_command = "npm test"
+```
+
+```toml
+# Python with uv
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "uv sync"]
+test_command = "uv run pytest -q"
+```
+
+### Notifications to Slack or Telegram
+
+`notify_command` runs on a stop, a pause and at the end, with the one-line message in
+`$RUN_TICKETS_MESSAGE`. The tokens come from the environment the runner starts in.
+
+```toml
+# Slack: an incoming webhook
+notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
+```
+
+```toml
+# Telegram: a bot token from @BotFather and your chat id
+notify_command = 'curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" --data-urlencode text="$RUN_TICKETS_MESSAGE"'
+```
+
+### Several features in one run
+
+```bash
+run-tickets run .scratch/feat-a .scratch/feat-b --keep-going
+```
+
+```toml
+branch = "feat/{{feature}}"          # a branch per feature
+worktree = true                      # each branch starts from your checkout's commit
+```
+
+Features run one after another, each with its own state, branch and summary. A stop or a
+pause ends the run there; `--keep-going` goes on to the next feature instead. With
+`worktree = true` the branches are independent. Without a worktree, your checkout is still
+on feat-a's branch when feat-b starts, so feat-b's branch grows from it. That is what you
+want when feat-b builds on feat-a.
 
 ## Features
 
@@ -393,6 +493,9 @@ Files are not merged: the first one found is used.
 
 - `run-tickets init` writes a file with every key commented out at its default, with an
   explanation.
+- [`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs)
+  has a ready config for each agent and for common setups, and [Recipes](#recipes) has
+  fragments for Docker, monorepos, worktrees and notifications.
 - `run-tickets config <feature>` shows which file was picked up, where each value comes from
   and the exact command each step runs.
 - A misspelled key is an error, not silently ignored.
@@ -573,8 +676,17 @@ out. A lock left by a dead process is taken over.
 
 ## What to read in the morning
 
+Start with **`runs/report.html`**: the whole run on one page, made for the morning. At the
+top, the outcome, the time and cost, the branch and the commands to look at the work. Below,
+a section per ticket and one for the final review. Each step shows its result, how long it
+took, links to its log and test log, and the agent's report rendered from markdown.
+Retries and stops are highlighted, then the ticket's commits and the files they changed.
+It is a single file with no network access. The runner rewrites it after every ticket;
+`run-tickets report <feature> --open` rebuilds it at any time and opens it.
+
 | File | What is in it |
 |---|---|
+| `runs/report.html` | the page above |
 | `runs/SUMMARY.md` | the outcome: how much is done, where and why it stopped, cost, branch, a table of tickets |
 | `runs/REPORT.md` | an entry per step: result or reason for stopping, duration, cost, tests, commits, suspicious test changes, the model's report |
 | `runs/<ticket>-<step>-<time>.log` | the agent's full output (for `claude`, the whole event stream) |
@@ -665,6 +777,10 @@ The tests run the real runner against a stub agent (`tests/stub_agent.py`). They
 
 CI (`.github/workflows/test.yml`) runs them on Linux, macOS and Windows with Python 3.9 and
 3.13.
+
+[CONTRIBUTING.md](https://github.com/omanei/run-tickets/blob/master/CONTRIBUTING.md) has
+the rules of the code (one file, Python 3.9, plain output as a stable interface) and the
+steps to add an agent preset.
 
 The GIF at the top is recorded from a real run of the demo in a pseudo-terminal:
 `python examples/record_demo.py` (Linux or macOS; needs `pillow` and `pyte`).

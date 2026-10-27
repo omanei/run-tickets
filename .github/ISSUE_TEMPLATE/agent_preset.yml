@@ -1,0 +1,49 @@
+name: Agent preset
+description: Support for another coding agent CLI, or a fix to an existing preset.
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A preset needs a way to run one prompt without a terminal and without approval
+        prompts. Until there is one, `[agents.<name>]` in your config runs any CLI: see
+        the README's Agents section.
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      placeholder: "my-agent 1.4.2 (https://github.com/…)"
+    validations:
+      required: true
+  - type: input
+    id: docs
+    attributes:
+      label: Its documentation for non-interactive use
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: A command that works
+      description: |
+        One prompt, no approval prompts, and the working directory set. Say how it takes
+        the prompt (an argument or stdin) and the model, and how it calls a skill.
+      render: shell
+      placeholder: my-agent exec --yes --cwd /path/to/repo --model x "the prompt"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Its output
+      description: |
+        Plain text or a JSON event stream? If JSON, paste a few lines of a real run: a
+        message, a tool call, the final result and the cost, if it reports one.
+      render: text
+  - type: dropdown
+    id: tried
+    attributes:
+      label: Have you run it with the runner?
+      options:
+        - "Yes, through [agents.<name>] in my config"
+        - "No"

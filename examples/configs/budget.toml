@@ -1,0 +1,15 @@
+# Hard limits on what a run may spend and how long it may take.
+
+agent = "claude"
+test_command = "make test"
+branch = "feat/{{feature}}"
+
+max_cost = 20                 # USD per run: once spent, the next step does not start
+max_step_cost = 5             # USD per step (claude takes it as --max-budget-usd)
+max_time = "90m"              # per step; then the agent's whole process tree is killed
+retries = 1                   # a failed step gets one more fresh process, then the run stops
+
+limit_wait = true             # a provider limit is waited out, not counted as a failure...
+limit_max_wait = "4h"         # ...for this long per step at most
+
+pause_after = ["01"]          # look at the first ticket before the run spends the rest
