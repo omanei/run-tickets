@@ -790,8 +790,9 @@ See [CHANGELOG.md](https://github.com/omanei/run-tickets/blob/master/CHANGELOG.m
 ### Releasing
 
 1. In a pull request: set the new version in `run_tickets.py` (`__version__`) and
-   `pyproject.toml`, and give its `CHANGELOG.md` section the version and date
-   (`## 0.5.0 - 2026-10-27`). Merge it.
+   `pyproject.toml`, and rename the `## Unreleased` heading of `CHANGELOG.md` to the version
+   and date (`## 0.5.0 - 2026-10-27`). Merge it. `python .github/scripts/release_check.py
+   0.5.0` checks all three before you tag.
 2. Tag the merge commit with the bare version, in either of two ways:
    - from git: `git tag 0.5.0 origin/master && git push origin 0.5.0`;
    - on GitHub: Releases → Draft a new release → Choose a tag → type `0.5.0` → Create new

@@ -1559,6 +1559,7 @@ def test_release_check_names_every_mismatch(tmp_path):
         release_check().check("1.2.3", tmp_path)
     assert "version in pyproject.toml is 1.2.2, not 1.2.3" in str(e.value)
     assert "no '## 1.2.3 - YYYY-MM-DD' section" in str(e.value)
+    assert "rename its '## Unreleased' heading to '## 1.2.3 - " in str(e.value)
     with pytest.raises(ValueError, match="not X.Y.Z"):
         release_check().check("v1.2.3", tmp_path)
     (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.2.3"\n')
