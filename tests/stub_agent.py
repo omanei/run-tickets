@@ -122,7 +122,14 @@ def main():
             text = text.replace("**Status:** ready-for-agent", "**Status:** done")
         ticket.write_text(text, encoding="utf-8")
     final = f"Done.\n\n## Step report\n- step: {step} {name} ({action})"
+    if os.environ.get("STUB_ANSI"):  # an agent that colors its own output
+        print("\x1b[31mFAILED\x1b[0m one test\x1b[2K, fixed it")
     if os.environ.get("STUB_STREAM"):  # Claude Code's --output-format stream-json
+        if os.environ.get("STUB_ODD_EVENTS"):  # shapes the runner does not expect
+            print(json.dumps({"type": "assistant", "message": {"content": [
+                "a string", {"type": "text", "text": None}, {"type": "tool_use", "input": [1]}]}}))
+            print(json.dumps({"type": "assistant", "message": "not a dict"}))
+            print(json.dumps({"type": "result", "subtype": "partial", "total_cost_usd": "n/a"}))
         print(json.dumps({"type": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Bash", "input": {"command": "git commit"}}]}}))
         print(json.dumps({"type": "result", "subtype": "success", "is_error": False,

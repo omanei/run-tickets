@@ -127,6 +127,8 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
         "prompt_via": "stdin",
         "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
         "output": "text",
+        # codex exec prints its commands' raw output and diffs, not just markdown.
+        "markdown": False,
         "export_command": [],
     },
 }
@@ -395,6 +397,7 @@ class Console:
     def __init__(self) -> None:
         self.live = False  # the live view; False: plain lines
         self.color = False
+        self.tty = False  # the status line is drawn only on a terminal
         self.lock = threading.RLock()
         self.status: Optional[Callable[[int], List[str]]] = None
         self.shown = 0  # status lines on the screen now
@@ -404,9 +407,9 @@ class Console:
         mode = (mode or "auto").lower()
         if mode not in UI_MODES:
             raise UsageError(f"ui must be one of {', '.join(UI_MODES)}, not '{mode}'")
+        self.tty = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
         if mode == "auto":
-            tty = sys.stdout.isatty() and os.environ.get("TERM") != "dumb"
-            self.live = tty and enable_vt()
+            self.live = self.tty and enable_vt()
         else:
             self.live = mode == "live"
             if self.live:
@@ -422,6 +425,15 @@ class Console:
 
     def width(self) -> int:
         return max(40, shutil.get_terminal_size((100, 24)).columns)
+
+    def path_arg(self, p: Any) -> str:
+        """A path to paste into a shell command: short when it can be, quoted when it must
+        be (a quoted ~/ would not expand, so a quoted path is absolute)."""
+        short = self.path(p)
+        if re.fullmatch(r"[\w@%+=:,./~\\-]+", short):
+            return short
+        full = str(p)
+        return f'"{full}"' if IS_WINDOWS else shlex.quote(full)
 
     def path(self, p: Any) -> str:
         """A path as short as it can be read: relative to the current directory, or ~/."""
@@ -470,8 +482,9 @@ class Console:
 
     @contextlib.contextmanager
     def showing(self, status: Callable[[int], List[str]]) -> Iterator[None]:
-        """Keeps `status(frame)` drawn under the output, redrawn ~8 times a second."""
-        if not self.live:
+        """Keeps `status(frame)` drawn under the output, redrawn ~8 times a second. Not
+        when the live view goes to a file (--ui live > log): there it would be noise."""
+        if not (self.live and self.tty):
             yield
             return
         outer = self.status
@@ -575,7 +588,10 @@ def warn(msg: str) -> None:
 class Markdown:
     """Renders markdown for the terminal line by line, as an agent prints it."""
 
-    FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([\w+#.-]*)")
+    # An info string after backticks has no backticks: "```bash ls```" is inline code.
+    FENCE_RE = re.compile(r"^(\s*)(`{3,}(?=[^`]*$)|~{3,})\s*(\S*)")
+    DIFF_START_RE = re.compile(r"^(diff --git |@@ -\d)")
+    DIFF_LINE_RE = re.compile(r"^([-+ @\\]|diff |index |new file|deleted file|similarity |rename )")
     HEADING_RE = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
     RULE_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
     TASK_RE = re.compile(r"^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$")
@@ -588,12 +604,19 @@ class Markdown:
         self.ui = ui
         self.fence = ""
         self.table: List[str] = []
+        self.diff = False  # inside a diff the agent printed: colored, not markdown
 
     def feed(self, line: str) -> List[str]:
         out: List[str] = []
         if self.table and (self.fence or not self.TABLE_RE.match(line)):
             out += self.flush()
         st = self.ui.style
+        if not self.fence:
+            self.diff = bool(self.DIFF_START_RE.match(line) or (self.diff and self.DIFF_LINE_RE.match(line)))
+            if self.diff:
+                color = {"+": "green", "-": "red", "@": "cyan"}.get(line[:1])
+                return out + [st(line, color) if color and not line.startswith(("+++", "---")) else
+                              st(line, "bold") if line.startswith(("diff ", "+++", "---")) else line]
         if self.fence:
             if re.match(rf"^\s*{re.escape(self.fence[0])}{{{len(self.fence)},}}\s*$", line):
                 self.fence = ""
@@ -602,7 +625,8 @@ class Markdown:
         m = self.FENCE_RE.match(line)
         if m:
             self.fence = m.group(2)
-            return out + [st("┌─" + (f" {m.group(3)}" if m.group(3) else ""), "gray")]
+            lang = m.group(3).lstrip("`~")
+            return out + [st("┌─" + (f" {lang}" if lang else ""), "gray")]
         if self.TABLE_RE.match(line):
             self.table.append(line)
             return out
@@ -660,6 +684,16 @@ class Markdown:
             return f"{m.group(1)}{st('▎', 'gray')} {st(self.inline(m.group(2)), 'italic')}"
         return self.inline(line)
 
+    # Emphasis opens only after a space, a bracket or a quote and closes only before one
+    # or before punctuation, so paths, globs and URLs (pkg/__init__.py, src/*.py,
+    # http://h/_a_) stay as they are.
+    _OPEN, _CLOSE = r"(?<![^\s(\[{\"'])", r"(?![^\s.,;:!?)\]}\"'])"
+    EMPHASIS = [(re.compile(_OPEN + r"\*\*(?![\s*])(.+?)(?<![\s*])\*\*" + _CLOSE), "bold"),
+                (re.compile(_OPEN + r"__(?![\s_])(.+?)(?<![\s_])__" + _CLOSE), "bold"),
+                (re.compile(_OPEN + r"\*(?![\s*])(.+?)(?<![\s*])\*" + _CLOSE), "italic"),
+                (re.compile(_OPEN + r"_(?![\s_])(.+?)(?<![\s_])_" + _CLOSE), "italic"),
+                (re.compile(_OPEN + r"~~(?!\s)(.+?)(?<!\s)~~" + _CLOSE), "strike")]
+
     def inline(self, text: str) -> str:
         st = self.ui.style
         out = []
@@ -670,17 +704,20 @@ class Markdown:
             if kind == 2:
                 out.append(st(part, "cyan"))
                 continue
-            part = re.sub(r"\[([^\]\n]+)\]\(([^)\s]+)\)", lambda m: st(m.group(1), "underline")
-                          + (st(f" ({m.group(2)})", "gray") if m.group(2) != m.group(1) else ""), part)
-            part = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", lambda m: st(m.group(1), "bold"), part)
-            part = re.sub(r"(?<!\w)__(?!\s)(.+?)(?<!\s)__(?!\w)", lambda m: st(m.group(1), "bold"), part)
-            part = re.sub(r"(?<![\w*])\*(?![\s*])(.+?)(?<![\s*])\*(?![\w*])",
-                          lambda m: st(m.group(1), "italic"), part)
-            part = re.sub(r"(?<![\w\\])_(?![\s_])(.+?)(?<![\s_])_(?!\w)",
-                          lambda m: st(m.group(1), "italic"), part)
-            part = re.sub(r"~~(?!\s)(.+?)(?<!\s)~~", lambda m: st(m.group(1), "strike"), part)
-            out.append(part)
+            # Links: text, label, url, text, ...; the url is printed as it is.
+            pieces = re.split(r"\[([^\]\n]+)\]\(([^)\s]+)\)", part)
+            for j in range(0, len(pieces), 3):
+                out.append(self.emphasis(pieces[j]))
+                if j + 2 < len(pieces):
+                    label, url = pieces[j + 1], pieces[j + 2]
+                    out.append(st(self.emphasis(label), "underline")
+                               + (st(f" ({url})", "gray") if url != label else ""))
         return "".join(out)
+
+    def emphasis(self, text: str) -> str:
+        for pattern, style in self.EMPHASIS:
+            text = pattern.sub(lambda m, s=style: self.ui.style(m.group(1), s), text)
+        return text
 
 
 def path_matches(path: str, pattern: str) -> bool:
@@ -754,8 +791,11 @@ class Ticket:
         self.path = path
         self.name = path.stem
         self.number = int(TICKET_NAME_RE.match(path.name).group(1))  # type: ignore[union-attr]
+        self.cached: Optional[str] = None  # set only inside Feature.snapshot()
 
     def text(self) -> str:
+        if self.cached is not None:
+            return self.cached
         try:
             return self.path.read_text(encoding="utf-8", errors="replace")
         except FileNotFoundError:
@@ -867,6 +907,21 @@ class Feature:
         self.runs = self.dir / "runs"
         if not self.issues.is_dir():
             raise UsageError(f"{self.dir} has no issues/ directory")
+        self._snapshot: Optional[List[Ticket]] = None
+
+    @contextlib.contextmanager
+    def snapshot(self) -> Iterator[None]:
+        """Inside it each ticket file is read once, however often the tickets are asked
+        about (blockers look at every other ticket). For views only: the runner's own
+        checks always read the files afresh."""
+        tickets = self.tickets()
+        for t in tickets:
+            t.cached = t.text()
+        self._snapshot = tickets
+        try:
+            yield
+        finally:
+            self._snapshot = None
 
     @property
     def name(self) -> str:
@@ -886,6 +941,8 @@ class Feature:
         return self.name
 
     def tickets(self) -> List[Ticket]:
+        if self._snapshot is not None:
+            return list(self._snapshot)
         found = [Ticket(p) for p in self.issues.iterdir()
                  if p.is_file() and TICKET_NAME_RE.match(p.name)]
         return sorted(found, key=lambda t: (t.number, t.name))
@@ -1228,6 +1285,7 @@ def resolve_agent(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
     agent.setdefault("skill_format", "/{{skill}} {{args}}")
     agent.setdefault("output", "text")
     agent.setdefault("export_command", [])
+    agent.setdefault("markdown", True)
     if agent["prompt_via"] not in ("arg", "stdin"):
         raise UsageError(f"[agents.{name}] prompt_via must be 'arg' or 'stdin'")
     return agent
@@ -1235,7 +1293,7 @@ def resolve_agent(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
 
 # Command-line flags that override config keys.
 CLI_KEYS = ("agent", "model", "max_time", "retries", "branch", "worktree", "final_review",
-            "test_command")
+            "test_command", "ui")
 
 
 def build_config(path: Optional[Path], args: argparse.Namespace) -> Dict[str, Any]:
@@ -1505,17 +1563,25 @@ def stream_items(line: str) -> List[Tuple[str, str, str]]:
     if not isinstance(ev, dict):
         return []
     items = []
-    if ev.get("type") == "assistant":
-        for c in (ev.get("message") or {}).get("content") or []:
+    message = ev.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if ev.get("type") == "assistant" and isinstance(content, list):
+        for c in content:
+            if not isinstance(c, dict):
+                continue
             if c.get("type") == "tool_use":
-                inp = c.get("input") or {}
+                inp = c.get("input") if isinstance(c.get("input"), dict) else {}
                 hint = inp.get("description") or inp.get("command") or inp.get("file_path") or ""
-                items.append(("tool", str(c.get("name")), str(hint).splitlines()[0][:120] if hint else ""))
-            elif c.get("type") == "text" and c.get("text", "").strip():
+                lines = str(hint).splitlines()
+                items.append(("tool", str(c.get("name")), lines[0][:120] if lines else ""))
+            elif c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].strip():
                 items.append(("text", c["text"].rstrip(), ""))
     elif ev.get("type") == "result":
-        items.append(("result", f"{ev.get('subtype')}, {ev.get('num_turns')} turns, "
-                                f"${ev.get('total_cost_usd') or 0:.2f}", ""))
+        try:
+            cost = float(ev.get("total_cost_usd") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        items.append(("result", f"{ev.get('subtype')}, {ev.get('num_turns')} turns, ${cost:.2f}", ""))
     return items
 
 
@@ -1537,8 +1603,10 @@ def stream_result(log: Path) -> Tuple[str, bool, Optional[float]]:
         if isinstance(ev, dict) and ev.get("type") == "result":
             text = ev.get("result") or text
             is_error = bool(ev.get("is_error"))
-            if ev.get("total_cost_usd") is not None:
-                cost = float(ev["total_cost_usd"])
+            try:
+                cost = float(ev["total_cost_usd"]) if ev.get("total_cost_usd") is not None else cost
+            except (TypeError, ValueError):
+                pass
     return text, is_error, cost
 
 
@@ -1915,17 +1983,24 @@ class Runner:
                             log.write(line)
                             log.flush()
                             self.last_output = time.monotonic()
-                            if UI.live:
-                                self.show_output(md, line, stream, step)
-                                continue
-                            shown = describe_stream_event(line) if stream else line.rstrip("\n")
-                            if shown is not None:
-                                say(shown)
+                            try:
+                                if UI.live:
+                                    self.show_output(md, line, stream, step, agent["markdown"])
+                                    continue
+                                shown = describe_stream_event(line) if stream else line.rstrip("\n")
+                                if shown is not None:
+                                    say(shown)
+                            except Exception:  # noqa: BLE001 - showing a line must never stop
+                                # the reading: an undrained pipe would block the agent.
+                                pass
                     except (OSError, ValueError):
                         pass
                     if UI.live:
-                        for rendered in md.flush():
-                            UI.write(self.gutter(step) + rendered)
+                        try:
+                            for rendered in md.flush():
+                                UI.write(self.gutter(step) + rendered)
+                        except Exception:  # noqa: BLE001
+                            pass
 
                 reader = threading.Thread(target=pump, daemon=True)
                 reader.start()
@@ -1979,9 +2054,9 @@ class Runner:
     def gutter(step: str) -> str:
         return "  " + UI.style("│", STEP_COLORS.get(step, "gray")) + " "
 
-    def show_output(self, md: Markdown, line: str, stream: bool, step: str) -> None:
-        """One line of the agent's output in the live view: markdown rendered, tool calls
-        on a line of their own."""
+    def show_output(self, md: Markdown, line: str, stream: bool, step: str, markdown: bool) -> None:
+        """One line of the agent's output in the live view: markdown rendered (unless the
+        agent prints raw tool output: markdown = false), tool calls on a line of their own."""
         line = line.rstrip("\r\n").split("\r")[-1]  # progress bars redraw with \r
         items = stream_items(line) if stream else [("text", line, "")]
         for kind, a, b in items:
@@ -1995,9 +2070,13 @@ class Runner:
                 UI.write(self.gutter(step) + UI.style(f"▸ result: {a}", "gray"))
             else:
                 for sub in a.split("\n"):
-                    if "\x1b" in sub:  # the agent colors its own output: keep the colors only
+                    if "\x1b" in sub and UI.color:  # the agent colors its output: keep the colors only
                         kept = ANSI_RE.sub(lambda m: m.group(0) if SGR_RE.fullmatch(m.group(0)) else "", sub)
                         UI.write(self.gutter(step) + kept + "\x1b[0m")
+                        continue
+                    sub = ANSI_RE.sub("", sub)
+                    if not markdown:
+                        UI.write(self.gutter(step) + sub)
                         continue
                     for rendered in md.feed(sub):
                         UI.write(self.gutter(step) + rendered)
@@ -2016,11 +2095,12 @@ class Runner:
 
     def board(self, current: str = "") -> str:
         """The progress bar and an icon per ticket, for the status line."""
-        tickets = self.feature.tickets()
-        done = sum(t.status() == DONE for t in tickets)
-        icons = [UI.ticket_icon(t.status(), t.name == current)
-                 + (UI.style(f"{t.number:02d}", "gray") if len(tickets) <= 12 else "")
-                 for t in tickets]
+        with self.feature.snapshot():
+            tickets = self.feature.tickets()
+            done = sum(t.status() == DONE for t in tickets)
+            icons = [UI.ticket_icon(t.status(), t.name == current)
+                     + (UI.style(f"{t.number:02d}", "gray") if len(tickets) <= 12 else "")
+                     for t in tickets]
         return f"{UI.bar(done, len(tickets))} {done}/{len(tickets)} done  " + " ".join(icons)
 
     def step_status(self, frame: int, label: str, step: str, attempt: int, started: float,
@@ -2222,7 +2302,7 @@ class Runner:
             if unit is not None:
                 ref = "final" if unit.name == FINAL else f"{unit.number:02d}"
                 lines += ["", UI.style("fix the cause, then rerun the step:", "gray"),
-                          f"  run-tickets retry {UI.path(self.feature.dir)} {ref}"]
+                          f"  run-tickets retry {UI.path_arg(self.feature.dir)} {ref}"]
             UI.write("\n" + "\n".join(UI.box(lines, "stopped", "red")))
             return EXIT_STOPPED
         if run is not None:
@@ -2234,8 +2314,9 @@ class Runner:
     def run(self) -> int:
         git_info = self.state.data.get("git", {})
         if UI.live:
-            UI.write("\n".join(live_header(self.feature, self.state.data, self.cfg)
-                               + live_ticket_rows(self.feature, self.state.data)))
+            with self.feature.snapshot():
+                UI.write("\n".join(live_header(self.feature, self.state.data, self.cfg)
+                                   + live_ticket_rows(self.feature, self.state.data)))
         else:
             say(f"run-tickets {__version__}: {self.feature.dir} with agent '{self.cfg['agent']}'"
                 + (f" ({self.cfg['config_path']})" if self.cfg["config_path"] else "")
@@ -2901,8 +2982,22 @@ def status_live(feature: Feature) -> List[str]:
     return out
 
 
+def configured_ui(feature: Feature) -> str:
+    """The `ui` key of the config `run` would read, for `status`."""
+    try:
+        path = find_config(feature.dir, Git(feature.dir).repo, None)
+    except UsageError:
+        return "auto"
+    return str(load_toml(path).get("ui", "auto")) if path else "auto"
+
+
 def cmd_status(feature: Feature, watch: Optional[float]) -> int:
-    render = status_live if UI.live else status_text
+    view = status_live if UI.live else status_text
+
+    def render(f: Feature) -> List[str]:
+        with f.snapshot():
+            return view(f)
+
     if not watch:
         for line in render(feature):
             say(line)
@@ -2954,7 +3049,7 @@ def cmd_config(feature: Feature, args: argparse.Namespace) -> int:
              "worktree", "worktree_dir", "worktree_setup",
              "final_review", "pause_after", "max_cost", "max_step_cost", "protected",
              "log_retention", "log_max_mb", "report_heading", "report_language",
-             "desktop_notify", "notify_command", "preflight", "extra_instructions",
+             "desktop_notify", "notify_command", "ui", "preflight", "extra_instructions",
              "review_extra_instructions", "final_review_extra_instructions")
     for key in shown:
         value = cfg.get(key)
@@ -3278,7 +3373,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "init":
             return cmd_init(args.dir, args.agent)
         if args.command == "status":
-            return cmd_status(Feature(Path(args.feature)), args.watch)
+            feature = Feature(Path(args.feature))
+            if not (args.ui or os.environ.get("RUN_TICKETS_UI")):
+                UI.setup(configured_ui(feature))
+            return cmd_status(feature, args.watch)
         if args.command == "config":
             return cmd_config(Feature(Path(args.feature)), args)
         if args.command == "adopt":

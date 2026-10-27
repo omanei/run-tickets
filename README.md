@@ -448,6 +448,7 @@ budget_args = []                         # at {{budget_args}}, when max_step_cos
 prompt_via = "arg"                       # "arg" or "stdin"
 skill_format = "/{{skill}} {{args}}"     # how the agent calls a skill
 output = "text"                          # or "claude-stream-json"
+markdown = true                          # false: show its output raw in the live view
 export_command = []                      # HTML transcript export, if the agent has one
 ```
 

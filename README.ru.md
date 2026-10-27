@@ -429,6 +429,7 @@ budget_args = []                         # на место {{budget_args}}, ес
 prompt_via = "arg"                       # "arg" или "stdin"
 skill_format = "/{{skill}} {{args}}"     # как агент вызывает скилл
 output = "text"                          # или "claude-stream-json"
+markdown = true                          # false: в живом виде вывод показывается как есть
 export_command = []                      # выгрузка HTML-транскрипта, если есть
 ```
 
