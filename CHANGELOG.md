@@ -4,6 +4,14 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+- omp and pi run with `--mode json` (the new `output = "pi-json"`): each tool call shows up
+  as it starts, live and in `status`, like Claude's, and their cost is reported and counts
+  toward `max_cost` (#10). A config that overrides their `command` without `--mode json`
+  keeps working: the output is shown as text.
+
 ## 0.5.0 - 2026-10-27
 
 ### Added

@@ -580,6 +580,65 @@ def test_claude_stream_output(basic, monkeypatch, capsys):
     assert '"type": "result"' not in basic.report()
 
 
+def use_pi_json(basic, monkeypatch):
+    monkeypatch.setenv("STUB_PI", "1")
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', 'output = "pi-json"\nskill_format'))
+
+
+def test_pi_json_output(basic, monkeypatch, capsys):
+    use_pi_json(basic, monkeypatch)
+    assert basic.run("--once") == 0
+    out = capsys.readouterr().out
+    assert "  · bash: git commit" in out and "Committing." in out
+    assert "  · result: stop, 2 turns, $0.50" in out
+    assert '"type"' not in out and "hmm" not in out  # no raw events, no thinking
+    assert "> - step: review 01-first (ok)" in basic.report()  # the last reply is the report
+    assert basic.state()["01-first"]["cost"] == pytest.approx(1.0)  # 2 steps x 2 replies x $0.25
+    assert "cost: $0.50" in basic.report()
+
+
+def test_pi_json_in_the_live_view(basic, monkeypatch, capsys):
+    use_pi_json(basic, monkeypatch)
+    assert basic.run("--once", "--ui", "live") == 0
+    out = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "│ ▸ bash git commit" in out and "│ Committing." in out
+    assert "│ Step report" in out and "▸ result: stop, 2 turns, $0.50" in out
+
+
+def test_pi_json_odd_events_do_not_stop_the_reading(basic, monkeypatch):
+    use_pi_json(basic, monkeypatch)
+    monkeypatch.setenv("STUB_ODD_EVENTS", "1")
+    assert basic.run("--once") == 0
+    assert "> - step: review 01-first (ok)" in basic.report()
+
+
+def test_pi_json_error_reply_is_the_result(tmp_path):
+    log = tmp_path / "step.log"
+    reply = {"role": "assistant", "content": [], "stopReason": "error",
+             "errorMessage": "429 rate limit exceeded, try again in 1s",
+             "usage": {"cost": {"total": 0.01}}}
+    log.write_text(json.dumps({"type": "message_end", "message": reply}) + "\nnot json\n")
+    text, is_error, cost = rt.stream_result(log, "pi-json")
+    assert is_error and "rate limit exceeded" in text and cost == pytest.approx(0.01)
+    assert rt.describe_stream_event(log.read_text().splitlines()[0], "pi-json") == \
+        "  · error: 429 rate limit exceeded, try again in 1s"
+
+
+def test_status_shows_the_last_tool_call_of_a_pi_json_step(tmp_path):
+    log = tmp_path / "step.log"
+    log.write_text(json.dumps({"type": "tool_execution_start", "toolName": "read",
+                               "args": {"path": "src/app.py"}}) + "\n"
+                   + json.dumps({"type": "message_update", "assistantMessageEvent": {"type": "text_delta"}}) + "\n")
+    assert rt.last_activity(log, "pi-json") == "· read: src/app.py"
+
+
+def test_unknown_output_kind_is_an_error(basic):
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', 'output = "jsonl"\nskill_format'))
+    assert basic.run() == rt.EXIT_USAGE
+
+
 def _argv(tmp_path, monkeypatch, agent, model=""):
     monkeypatch.setattr(rt.shutil, "which", lambda name: f"/bin/{name}")
     repo = tmp_path / "r"
@@ -593,8 +652,8 @@ def _argv(tmp_path, monkeypatch, agent, model=""):
 
 def test_omp_argv(tmp_path, monkeypatch):
     argv, repo = _argv(tmp_path, monkeypatch, "omp", "opus")
-    assert argv == ["/bin/omp", "--model", "opus", "-p", "--auto-approve", "--session-dir",
-                    str(Path("/s")), "--cwd", repo, "PROMPT"]
+    assert argv == ["/bin/omp", "--model", "opus", "-p", "--mode", "json", "--auto-approve",
+                    "--session-dir", str(Path("/s")), "--cwd", repo, "PROMPT"]
 
 
 def test_claude_argv_reads_prompt_from_stdin(tmp_path, monkeypatch):

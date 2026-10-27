@@ -186,8 +186,8 @@ On a terminal the runner shows a live view:
 - a header for each ticket and each step;
 - the agent's output with its markdown rendered: headings, lists, checkboxes, code blocks
   with syntax highlighting, framed tables (both by [rich](https://github.com/Textualize/rich)
-  when it is installed, as it is with uv or pipx), and diffs in color. Claude's tool calls get
-  a line each;
+  when it is installed, as it is with uv or pipx), and diffs in color. Each tool call of Claude,
+  omp or pi gets a line of its own as it starts (`▸ bash  npm test`);
 - a line at the end of each step saying whether it passed or failed, and why;
 - a status line at the bottom: the ticket, the step, the attempt, the time it has run, how
   long the agent has been silent, the cost, and progress across the feature (`✓01 ●02 ○03`);
@@ -341,8 +341,8 @@ model = "opus"
 - `max_step_cost`: a limit per step, passed to agents that take one (`--max-budget-usd` for
   `claude`).
 
-Only `claude` reports cost so far. It shows up in REPORT.md and SUMMARY.md, and
-`run-tickets config` warns when the chosen agent's budget does not apply.
+`claude`, `omp` and `pi` report cost (`codex` does not). It shows up in REPORT.md and
+SUMMARY.md, and `run-tickets config` warns when the chosen agent's budget does not apply.
 
 ### Protected paths and weakened tests
 
@@ -441,8 +441,8 @@ Files are not merged: the first one found is used.
 
 | `agent` | What runs | Skill call |
 |---|---|---|
-| `omp` | `omp -p --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
-| `pi` | `pi -p --session-dir … "<prompt>"` | `/skill:implement …` |
+| `omp` | `omp -p --mode json --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
+| `pi` | `pi -p --mode json --session-dir … "<prompt>"` | `/skill:implement …` |
 | `claude` | `claude -p --output-format stream-json --verbose --permission-mode bypassPermissions`, prompt on stdin | `/implement …` |
 | `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox -C … -` | in words |
 
@@ -458,7 +458,7 @@ model_args = ["--model", "{{model}}"]   # at {{model_args}}, only when a model i
 budget_args = []                         # at {{budget_args}}, when max_step_cost is set
 prompt_via = "arg"                       # "arg" or "stdin"
 skill_format = "/{{skill}} {{args}}"     # how the agent calls a skill
-output = "text"                          # or "claude-stream-json"
+output = "text"                          # or "claude-stream-json", "pi-json" (pi/omp --mode json)
 markdown = true                          # false: show its output raw in the live view
 export_command = []                      # HTML transcript export, if the agent has one
 ```
@@ -620,7 +620,7 @@ out of your checkout. Only a container gives full isolation.
 **Limitations:**
 - a review looks at `since <base>`, so commits that land on the branch between steps would be
   included;
-- only `claude` reports cost, so `max_cost` does not apply to the other agents;
+- `codex` reports no cost, so `max_cost` does not apply to it;
 - tickets of one feature run strictly one at a time; there is no parallel mode.
 
 ## Development

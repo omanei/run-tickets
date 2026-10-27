@@ -163,7 +163,8 @@ run-tickets init   [--agent claude]         # создать .ticket-runner.toml
 - вывод агента с отрисованным markdown: заголовки, списки, чекбоксы, блоки кода с подсветкой
   синтаксиса, таблицы в рамке и цветные диффы. Подсветку и рамки рисует
   [rich](https://github.com/Textualize/rich), если он установлен, а при установке через uv или
-  pipx он ставится сам. Вызовы инструментов Claude идут отдельными строками;
+  pipx он ставится сам. Каждый вызов инструмента Claude, omp или pi
+  появляется отдельной строкой в момент запуска (`▸ bash  npm test`);
 - строку в конце каждого шага: прошёл он или нет и почему;
 - строку статуса внизу: тикет, шаг, попытка, сколько идёт шаг, сколько агент молчит,
   стоимость и прогресс по фиче (`✓01 ●02 ○03`);
@@ -320,7 +321,7 @@ model = "opus"
 - `max_step_cost` — лимит на один шаг. Передаётся агенту, если тот принимает такой флаг
   (у `claude` это `--max-budget-usd`).
 
-Стоимость сейчас сообщает только `claude`. Она видна в REPORT.md и SUMMARY.md.
+Стоимость сообщают `claude`, `omp` и `pi` (`codex` нет). Она видна в REPORT.md и SUMMARY.md.
 `run-tickets config` предупреждает, если у выбранного агента бюджет не работает.
 
 ### Защищённые пути и ослабленные тесты
@@ -420,8 +421,8 @@ model = "opus"
 
 | `agent` | Что запускается | Вызов скилла |
 |---|---|---|
-| `omp` | `omp -p --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
-| `pi` | `pi -p --session-dir … "<prompt>"` | `/skill:implement …` |
+| `omp` | `omp -p --mode json --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
+| `pi` | `pi -p --mode json --session-dir … "<prompt>"` | `/skill:implement …` |
 | `claude` | `claude -p --output-format stream-json --verbose --permission-mode bypassPermissions`, промпт через stdin | `/implement …` |
 | `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox -C … -` | текстом |
 
@@ -437,7 +438,7 @@ model_args = ["--model", "{{model}}"]   # на место {{model_args}}, тол
 budget_args = []                         # на место {{budget_args}}, если задан max_step_cost
 prompt_via = "arg"                       # "arg" или "stdin"
 skill_format = "/{{skill}} {{args}}"     # как агент вызывает скилл
-output = "text"                          # или "claude-stream-json"
+output = "text"                          # или "claude-stream-json", "pi-json" (pi/omp --mode json)
 markdown = true                          # false: в живом виде вывод показывается как есть
 export_command = []                      # выгрузка HTML-транскрипта, если есть
 ```
@@ -600,7 +601,7 @@ run-tickets adopt .scratch/my-feature --feature-base <sha> --resume 16:review:<s
 **Ограничения:**
 - review смотрит диапазон `since <база>` и захватит посторонние коммиты, если они появятся в
   ветке между шагами;
-- стоимость сообщает только `claude`, у остальных агентов `max_cost` не работает;
+- `codex` не сообщает стоимость, для него `max_cost` не работает;
 - тикеты из одной фичи выполняются строго по одному, параллельного режима нет.
 
 ## Разработка
