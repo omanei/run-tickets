@@ -216,6 +216,102 @@ protected = ["migrations/", ".github/"]
 notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
 ```
 
+Готовые конфиги для каждого агента и для частых случаев лежат в
+[`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs).
+
+## Рецепты
+
+Короткие конфиги под частые устройства проекта. Каждый блок — фрагмент `.ticket-runner.toml`:
+добавьте к нему агента и остальные настройки, а результат проверьте командой
+`run-tickets config <папка фичи>`.
+
+### Тесты в Docker
+
+Если тестам нужны база или другие сервисы, пусть их гоняет свежий контейнер из рабочей копии
+раннера:
+
+```toml
+test_command = "docker compose run --rm app pytest -q"
+preflight = ["docker info"]          # Docker не запущен — стоп до старта агента
+```
+
+`docker compose run` читает compose-файл из рабочей копии, поэтому bind mount на `.`
+монтирует код, который только что написал агент. Так работает и с `worktree = true`. С
+долгоживущим контейнером иначе. Если тесты идут в контейнере, запущенном из основной копии
+(`docker compose exec app pytest`), он видит код вашей копии. В worktree изменения агента
+вообще не проверялись бы. Тогда оставьте `worktree = false`:
+
+```toml
+branch = "feat/{{feature}}"
+worktree = false                     # контейнер смонтирован на эту копию
+test_command = "docker compose exec -T app pytest -q"   # -T: у раннера нет терминала
+preflight = ["docker compose ps --status running --services | grep -q app"]
+```
+
+### Монорепозиторий, где меняется один пакет
+
+```toml
+test_command = "cd packages/api && npm test"   # запускается из корня репозитория
+extra_instructions = "This feature changes only packages/api. Do not edit other packages."
+protected = ["packages/web/"]        # агент тронул — раннер останавливается
+```
+
+Команды выполняются в корне рабочей копии. Если фичи трогают разные пакеты, положите конфиг в
+папку каждой фичи. Он важнее конфига в корне репозитория, а файлы не сливаются, так что в нём
+должен быть весь конфиг.
+
+### Node или Python в worktree
+
+В новом worktree есть только файлы под git. `worktree_setup` один раз, до первого шага,
+доносит остальное: `.env` из вашей копии (`$RUN_TICKETS_MAIN_REPO`) и зависимости. Если
+настройка упала, запуск останавливается, а в следующий раз она повторяется.
+
+```toml
+# Node
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "npm ci"]
+test_command = "npm test"
+```
+
+```toml
+# Python с uv
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "uv sync"]
+test_command = "uv run pytest -q"
+```
+
+### Уведомления в Slack или Telegram
+
+`notify_command` запускается при остановке, паузе и в конце, текст в одну строку — в
+`$RUN_TICKETS_MESSAGE`. Токены берутся из окружения, в котором запущен раннер.
+
+```toml
+# Slack: incoming webhook
+notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
+```
+
+```toml
+# Telegram: токен бота от @BotFather и id вашего чата
+notify_command = 'curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" --data-urlencode text="$RUN_TICKETS_MESSAGE"'
+```
+
+### Несколько фич за один запуск
+
+```bash
+run-tickets run .scratch/feat-a .scratch/feat-b --keep-going
+```
+
+```toml
+branch = "feat/{{feature}}"          # своя ветка на фичу
+worktree = true                      # каждая ветка начинается от коммита вашей копии
+```
+
+Фичи идут одна за другой, у каждой своё состояние, ветка и сводка. Остановка или пауза
+заканчивают запуск на этой фиче, а с `--keep-going` раннер переходит к следующей. С
+`worktree = true` ветки независимы. Без worktree ваша копия к старту feat-b ещё стоит на
+ветке feat-a, и ветка feat-b растёт из неё. Это то, что нужно, когда feat-b опирается на
+feat-a.
+
 ## Возможности
 
 ### Тесты запускает раннер, а не агент
@@ -375,6 +471,9 @@ model = "opus"
 Файлы не сливаются: раннер берёт первый найденный.
 
 - `run-tickets init` создаёт файл, где все ключи с умолчаниями закомментированы и объяснены.
+- В [`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs)
+  лежат готовые конфиги для каждого агента и для частых случаев, а в [Рецептах](#рецепты) —
+  фрагменты для Docker, монорепозитория, worktree и уведомлений.
 - `run-tickets config <feature>` показывает, какой файл подхватился, откуда взялось каждое
   значение и какой командой будет запущен агент на каждом шаге.
 - Если в конфиге опечатка в ключе, раннер не запустится, а не проигнорирует её молча.

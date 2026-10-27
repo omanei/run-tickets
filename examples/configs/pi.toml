@@ -1,0 +1,12 @@
+# pi. Copy to .ticket-runner.toml in your repository root.
+# Check it with: run-tickets config <feature dir>
+
+agent = "pi"
+# model = ""                  # passed as --model; empty: pi's own default
+
+test_command = "make test"    # the runner runs the tests itself after every step
+branch = "feat/{{feature}}"   # the work goes to its own branch; nothing is pushed
+
+# pi reports cost through --mode json, so max_cost applies. It takes no per-step
+# budget flag: max_step_cost does not.
+max_cost = 30                 # USD per run

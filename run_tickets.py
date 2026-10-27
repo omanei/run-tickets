@@ -1631,6 +1631,7 @@ EXAMPLE_CONFIG = '''# run-tickets config: https://github.com/omanei/run-tickets#
 # root. Command-line flags win over this file. Every key is optional: the commented
 # lines show the defaults; uncomment and change only what your project needs.
 # `run-tickets config <feature dir>` prints the effective values and the agent commands.
+# Ready configs per agent and setup: https://github.com/omanei/run-tickets/tree/master/examples/configs
 
 agent = "{{init_agent}}"           # a preset (`run-tickets init --help` lists them) or [agents.<name>]
 # model = ""                # passed to the agent (its model_args) when set

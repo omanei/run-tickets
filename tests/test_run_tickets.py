@@ -1200,6 +1200,54 @@ def test_the_demo_runs_and_catches_the_agents_slip():
     assert "final review: done" in r.stdout
 
 
+
+# --- the example configs, and the config fragments in the READMEs -----------------------
+
+EXAMPLE_CONFIGS = sorted((ROOT / "examples" / "configs").glob("*.toml"))
+
+
+def load_config(path, tmp_path):
+    return rt.build_config(path, rt.parse_args(["run", str(tmp_path)]))
+
+
+@pytest.mark.parametrize("path", EXAMPLE_CONFIGS, ids=lambda p: p.name)
+def test_example_config_loads(path, tmp_path):
+    cfg = load_config(path, tmp_path)
+    assert cfg["config_path"] == str(path)
+
+
+def test_each_main_agent_has_an_example_config(tmp_path):
+    for agent in ("claude", "codex", "omp", "pi"):
+        assert load_config(ROOT / "examples" / "configs" / f"{agent}.toml", tmp_path)["agent"] == agent
+
+
+def test_the_example_configs_are_listed_in_their_readme():
+    listed = (ROOT / "examples" / "configs" / "README.md").read_text(encoding="utf-8")
+    assert EXAMPLE_CONFIGS
+    for path in EXAMPLE_CONFIGS:
+        assert f"]({path.name})" in listed, path.name
+
+
+def test_the_split_models_example_sets_a_model_per_step(tmp_path):
+    cfg = load_config(ROOT / "examples" / "configs" / "cheap-implement-strong-review.toml", tmp_path)
+    assert cfg["step"]["implement"]["model"] == "sonnet"
+    assert cfg["step"]["review"]["model"] == cfg["step"]["verify"]["model"] == "opus"
+    assert cfg["step"]["final"]["model"] == "opus"
+
+
+def readme_toml_blocks():
+    for name in ("README.md", "README.ru.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for i, block in enumerate(re.findall(r"```toml\n(.*?)```", text, re.S)):
+            yield pytest.param(block, id=f"{name}-{i}")
+
+
+@pytest.mark.parametrize("block", list(readme_toml_blocks()))
+def test_readme_config_fragment_loads(block, tmp_path):
+    path = tmp_path / "fragment.toml"
+    path.write_text(block, encoding="utf-8")
+    load_config(path, tmp_path)
+
 # --- the console ------------------------------------------------------------------
 
 

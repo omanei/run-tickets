@@ -237,6 +237,102 @@ protected = ["migrations/", ".github/"]
 notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
 ```
 
+More ready-made configs, one per agent and for common setups, are in
+[`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs).
+
+## Recipes
+
+Short configs for common project shapes. Each block is a fragment of a `.ticket-runner.toml`;
+combine it with the agent and the rest of your settings, then check the result with
+`run-tickets config <feature dir>`.
+
+### Tests in Docker
+
+When the tests need a database or other services, let a fresh container run them from the
+runner's working tree:
+
+```toml
+test_command = "docker compose run --rm app pytest -q"
+preflight = ["docker info"]          # no Docker daemon: stop before an agent starts
+```
+
+`docker compose run` reads the compose file in the working tree, so a bind mount of `.`
+mounts the code the agent just wrote, and this works with `worktree = true` too. A
+long-lived container is different. If the tests run in one that was started from your main
+checkout (`docker compose exec app pytest`), it sees your checkout's code. In a worktree, the
+agent's changes would not be tested at all. Keep `worktree = false` then:
+
+```toml
+branch = "feat/{{feature}}"
+worktree = false                     # the container mounts this checkout
+test_command = "docker compose exec -T app pytest -q"   # -T: the runner has no terminal
+preflight = ["docker compose ps --status running --services | grep -q app"]
+```
+
+### A monorepo where one package changes
+
+```toml
+test_command = "cd packages/api && npm test"   # run from the repository root
+extra_instructions = "This feature changes only packages/api. Do not edit other packages."
+protected = ["packages/web/"]        # the agent touching it stops the run
+```
+
+The commands run in the root of the working tree. When features touch different packages,
+put a config in each feature's directory. It wins over the one in the repository root, and
+the files are not merged, so it holds the whole config.
+
+### Node or Python in a worktree
+
+A new worktree has only tracked files. `worktree_setup` brings in the rest once, before the
+first step: `.env` from your checkout (`$RUN_TICKETS_MAIN_REPO`), the dependencies. A failed
+setup stops the run and is repeated on the next one.
+
+```toml
+# Node
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "npm ci"]
+test_command = "npm test"
+```
+
+```toml
+# Python with uv
+worktree = true
+worktree_setup = ['cp "$RUN_TICKETS_MAIN_REPO/.env" .', "uv sync"]
+test_command = "uv run pytest -q"
+```
+
+### Notifications to Slack or Telegram
+
+`notify_command` runs on a stop, a pause and at the end, with the one-line message in
+`$RUN_TICKETS_MESSAGE`. The tokens come from the environment the runner starts in.
+
+```toml
+# Slack: an incoming webhook
+notify_command = 'curl -s -X POST -H "Content-type: application/json" --data "{\"text\": \"$RUN_TICKETS_MESSAGE\"}" "$SLACK_WEBHOOK_URL"'
+```
+
+```toml
+# Telegram: a bot token from @BotFather and your chat id
+notify_command = 'curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" -d chat_id="$TELEGRAM_CHAT_ID" --data-urlencode text="$RUN_TICKETS_MESSAGE"'
+```
+
+### Several features in one run
+
+```bash
+run-tickets run .scratch/feat-a .scratch/feat-b --keep-going
+```
+
+```toml
+branch = "feat/{{feature}}"          # a branch per feature
+worktree = true                      # each branch starts from your checkout's commit
+```
+
+Features run one after another, each with its own state, branch and summary. A stop or a
+pause ends the run there; `--keep-going` goes on to the next feature instead. With
+`worktree = true` the branches are independent. Without a worktree, your checkout is still
+on feat-a's branch when feat-b starts, so feat-b's branch grows from it. That is what you
+want when feat-b builds on feat-a.
+
 ## Features
 
 ### The runner runs the tests, not the agent
@@ -394,6 +490,9 @@ Files are not merged: the first one found is used.
 
 - `run-tickets init` writes a file with every key commented out at its default, with an
   explanation.
+- [`examples/configs/`](https://github.com/omanei/run-tickets/tree/master/examples/configs)
+  has a ready config for each agent and for common setups, and [Recipes](#recipes) has
+  fragments for Docker, monorepos, worktrees and notifications.
 - `run-tickets config <feature>` shows which file was picked up, where each value comes from
   and the exact command each step runs.
 - A misspelled key is an error, not silently ignored.

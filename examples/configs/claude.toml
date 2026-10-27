@@ -1,0 +1,17 @@
+# Claude Code. Copy to .ticket-runner.toml in your repository root.
+# Check it with: run-tickets config <feature dir>
+
+agent = "claude"
+# model = "sonnet"            # empty: Claude Code's own default
+
+test_command = "make test"    # the runner runs the tests itself after every step
+branch = "feat/{{feature}}"   # the work goes to its own branch; nothing is pushed
+
+# Claude Code reports cost, so both limits apply.
+max_cost = 30                 # USD per run: the next step does not start once spent
+max_step_cost = 8             # USD per step, passed as --max-budget-usd
+
+# Skills installed from a Claude Code plugin carry its prefix.
+# [skills]
+# implement = "<plugin>:implement"
+# review = "<plugin>:code-review"
