@@ -530,8 +530,13 @@ An implement step without commits is not a failure: the verify step checks its r
 previous attempt's report. There are `retries + 1` attempts; after the last one the run
 stops.
 
+**Ctrl+C** pressed once lets the current step finish and its checks run, then stops the
+runner before the next one (exit code 130): nothing is cut off, and the next run starts
+with the next step. While the runner waits (a provider limit, a retry delay) it stops at
+once. A second Ctrl+C, or `kill`, stops it immediately, mid-step.
+
 **State** lives in `runs/state.json`, written atomically before and after each step. Run the
-same command after Ctrl+C, `kill -9` or a power cut:
+same command after a second Ctrl+C, `kill -9` or a power cut:
 
 - **implement was cut off:** implement reruns with the same base, and the agent is told its
   partial work is in the commits.

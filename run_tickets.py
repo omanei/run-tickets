@@ -256,6 +256,32 @@ class Interrupted(Exception):
     pass
 
 
+class StopRequest:
+    """Ctrl+C during a run: the first press lets the current step finish and its checks
+    run, then the runner stops with the state clean; the second press stops it at once.
+    Outside the loop of steps (setup, a question on the terminal) Ctrl+C stops at once."""
+
+    def __init__(self) -> None:
+        self.armed = False  # the loop of steps runs
+        self.requested = False
+
+    def reset(self) -> None:
+        self.__init__()  # type: ignore[misc]
+
+    def on_sigint(self, _signum: int, _frame: Any) -> None:
+        if not self.armed or self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+        if not UI.live:  # the live view's status line says it
+            try:
+                print("\n==> stopping after this step; Ctrl+C again stops now", flush=True)
+            except Exception:  # noqa: BLE001 - print may be busy in the interrupted code
+                pass
+
+
+STOP = StopRequest()
+
+
 def now() -> dt.datetime:
     return dt.datetime.now().astimezone()
 
@@ -663,6 +689,13 @@ def warn(msg: str) -> None:
         UI.write(UI.style(msg, "yellow"), err=True)
     else:
         print(msg, file=sys.stderr, flush=True)
+
+
+def stop_hint() -> str:
+    """What Ctrl+C does now, for the status line."""
+    if STOP.requested:
+        return UI.style("stopping after this step · ctrl+c again stops now", "yellow", "bold")
+    return UI.style("ctrl+c stops after this step", "gray")
 
 
 class Markdown:
@@ -2258,15 +2291,14 @@ class Runner:
         if self.run_cost:
             bits.append(fmt_cost(self.run_cost))
         spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], color, "bold")
-        return [f"{spin} " + UI.style(" · ", "gray").join(bits),
-                f"  {board}" + UI.style("   ctrl+c stops; run it again to resume", "gray")]
+        return [f"{spin} " + UI.style(" · ", "gray").join(bits), f"  {board}   " + stop_hint()]
 
     def waiting_status(self, what: str, until: float) -> Callable[[int], List[str]]:
         def status(frame: int) -> List[str]:
             left = max(0, until - time.monotonic())
             spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], "yellow")
             return [f"{spin} {what} · {fmt_duration(left)} left",
-                    UI.style("  ctrl+c stops; run it again to resume", "gray")]
+                    "  " + stop_hint()]
         return status
 
     def export_transcript(self, agent: Dict[str, Any], session_dir: Path, stamp: str) -> Optional[Path]:
@@ -2502,7 +2534,10 @@ class Runner:
         if pre:
             return self.stop(None, "preflight", pre)
 
+        STOP.armed = True  # from here the first Ctrl+C waits for the end of the step
         while True:
+            if STOP.requested:
+                return self.stopped_on_request()
             ticket = self.feature.next_ticket()
             if ticket is None:
                 return self.finish()
@@ -2513,6 +2548,32 @@ class Runner:
             if self.opts.once:
                 self.print_done()
                 return EXIT_OK
+
+    @staticmethod
+    def nap(seconds: float) -> None:
+        """A pause that the first Ctrl+C ends: no step runs, so there is nothing to wait for."""
+        end = time.monotonic() + seconds
+        while not STOP.requested and time.monotonic() < end:
+            time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+
+    def stopped_on_request(self, unit: Any = None, step: str = "", failure: str = "") -> int:
+        """Ctrl+C was pressed once and the step it came in has ended: stop before the next
+        one. The state says where to go on; a failed attempt's reason goes to the next run."""
+        where = f"{unit.name} ({step})" if unit is not None else "the next ticket"
+        if unit is not None:
+            self.state.update(unit.name, phase=step, running=False,
+                              last_stop={"step": step, "reason": f"{failure} (not retried: Ctrl+C)",
+                                         "time": iso()} if failure else None)
+        self.event("stop_requested", ticket=unit.name if unit is not None else None, step=step)
+        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} STOPPED ON REQUEST (Ctrl+C) - before {where}\n\n")
+        self.write_summary("stopped on request", f"before {where}; run the same command to go on")
+        self.print_done()
+        say(f"\nstopped as asked (Ctrl+C), before {where}; the state is saved, run the same "
+            f"command to go on",
+            live="\n" + "\n".join(UI.box([UI.style(f"■ stopped as asked, before {where}", "yellow", "bold"),
+                                           "the state is saved; run the same command to go on"],
+                                          "stopped", "yellow")))
+        return EXIT_INTERRUPTED
 
     def can_ask(self) -> bool:
         """Someone is at the terminal to answer (never in a piped, nohup or CI run)."""
@@ -2616,6 +2677,8 @@ class Runner:
             say(f"==> {ticket.name}: resuming at {entry['phase']} (base {entry['base'][:10]})")
 
         pre = self.preflight(ticket.name)
+        if pre and STOP.requested:  # Ctrl+C reached the preflight command too
+            return self.stopped_on_request(ticket, entry["phase"])
         if pre:
             return self.stop(ticket, entry["phase"], pre, None, entry["base"])
         baseline_stop = (entry.get("last_stop") or {}).get("step") == "baseline"
@@ -2671,7 +2734,10 @@ class Runner:
         note = self.resume_note(unit, step, entry)
         attempts = self.cfg["retries"] + 1
         attempt, waited = 0, 0
+        failure = ""  # of the last attempt, for the next run when it stops here
         while True:
+            if STOP.requested:
+                return self.stopped_on_request(unit, step, failure)
             if self.cfg["max_cost"] and self.run_cost >= self.cfg["max_cost"]:
                 return self.stop(unit, step, f"the run's budget is spent: {fmt_cost(self.run_cost)} "
                                              f"of max_cost {fmt_cost(self.cfg['max_cost'])}",
@@ -2690,6 +2756,7 @@ class Runner:
                     self.show_step_result(unit, step, run)
                 return self.step_passed(unit, step, run, entry)
             reason, retryable = failed
+            failure = reason
             if UI.live:
                 UI.write(f"  {UI.style('✗', 'red')} {UI.style(f'{step} failed:', 'red', 'bold')} "
                          f"{reason.splitlines()[0]} {UI.style(fmt_duration(run.seconds), 'gray')}")
@@ -2711,7 +2778,7 @@ class Runner:
                          f"waiting until {until:%H:%M}, then the step goes on")
                 with UI.showing(self.waiting_status(f"waiting for the provider's limit "
                                                     f"(until {until:%H:%M})", time.monotonic() + wait)):
-                    time.sleep(wait)
+                    self.nap(wait)
                 self.state.set(waiting=None)
                 waited += wait
                 note = (f"A previous {step} run of this ticket was cut off by the provider's usage "
@@ -2731,7 +2798,7 @@ class Runner:
                 live=f"  {UI.style('↻', 'yellow')} retrying with a fresh process "
                      f"({attempt}/{attempts - 1})" + (f" in {fmt_duration(delay)}" if delay else ""))
             with UI.showing(self.waiting_status("retrying soon", time.monotonic() + delay)):
-                time.sleep(delay)
+                self.nap(delay)
             note = self.retry_note(step, reason, run)
 
     def triage_new_tickets(self, unit: Any, entry: Dict[str, Any]) -> None:
@@ -2889,6 +2956,8 @@ class Runner:
             self.state.update(FINAL, phase="final", base=base, branch=self.git.branch(),
                               running=False, started=iso())
         pre = self.preflight("final review")
+        if pre and STOP.requested:  # Ctrl+C reached the preflight command too
+            return self.stopped_on_request(unit, "final")
         if pre:
             return self.stop(unit, "final", pre, None, base)
         if UI.live:
@@ -3554,6 +3623,7 @@ def run_feature(path: Path, args: argparse.Namespace) -> int:
         runner.notify(f"run-tickets crashed: {e!r}")
         raise
     finally:
+        STOP.armed = False  # the next feature's setup: Ctrl+C stops at once
         work_lock.release()
         feature_lock.release()
 
@@ -3597,7 +3667,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 signal.signal(getattr(signal, name), on_signal)
             except (OSError, ValueError):
                 pass
+    STOP.reset()
+    try:
+        previous_sigint = signal.signal(signal.SIGINT, STOP.on_sigint)
+    except (OSError, ValueError):  # not the main thread
+        previous_sigint = None
+    try:
+        return run_features(args)
+    finally:
+        STOP.reset()
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
 
+
+def run_features(args: argparse.Namespace) -> int:
     worst = EXIT_OK
     for i, f in enumerate(args.features):
         if len(args.features) > 1:

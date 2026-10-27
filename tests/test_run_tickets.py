@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -402,6 +403,68 @@ def test_dirty_tree_never_asks_without_input(basic, terminal):
     assert basic.run("--ui", "live", "--no-input") == rt.EXIT_USAGE
     assert basic.run("--ui", "plain") == rt.EXIT_USAGE  # plain lines: no questions either
     assert asked == []
+
+
+posix_only = pytest.mark.skipif(rt.IS_WINDOWS, reason="the stub sends SIGINT to the runner")
+
+
+@posix_only
+def test_first_ctrl_c_lets_the_step_finish(basic, capsys):
+    basic.set_plan({"01-first:implement": ["sigint"]})
+    assert basic.run() == rt.EXIT_INTERRUPTED
+    assert basic.keys() == ["01-first:implement"]  # implement finished and passed its checks
+    entry = basic.state()["01-first"]
+    assert entry["phase"] == "review" and not entry["running"] and not entry.get("last_stop")
+    out = capsys.readouterr().out
+    assert "stopping after this step" in out
+    assert "stopped as asked (Ctrl+C), before 01-first (review)" in out
+    assert "STOPPED ON REQUEST (Ctrl+C) - before 01-first (review)" in basic.report()
+    assert basic.run("--once") == 0  # the next run goes on with the review
+    assert basic.keys() == ["01-first:implement", "01-first:review"]
+    assert "was interrupted" not in basic.calls_list()[1]["prompt"]
+
+
+@posix_only
+def test_failed_attempt_is_not_retried_after_ctrl_c(basic):
+    basic.write_config(retries=2)
+    basic.set_plan({"01-first:implement": ["sigint-fail", "ok"]})
+    assert basic.run() == rt.EXIT_INTERRUPTED
+    assert basic.keys() == ["01-first:implement"]
+    assert basic.state()["01-first"]["last_stop"]["reason"] == "the agent exited with 1 (not retried: Ctrl+C)"
+    assert basic.run("--once") == 0
+    assert "was stopped by the runner: the agent exited with 1" in basic.calls_list()[1]["prompt"]
+
+
+@posix_only
+def test_second_ctrl_c_stops_at_once(basic):
+    basic.set_plan({"01-first:implement": ["sigint-twice", "ok"]})
+    started = time.monotonic()
+    assert basic.run() == rt.EXIT_INTERRUPTED
+    assert time.monotonic() - started < 30  # the agent sleeps for 120 s
+    assert basic.state()["01-first"]["running"]  # cut off mid-step: the next run resumes it
+    time.sleep(1)
+    assert not rt.pid_alive(int(basic.pidfile.read_text()))
+    assert basic.run("--once") == 0
+    assert "was interrupted before it finished" in basic.calls_list()[1]["prompt"]
+
+
+def test_ctrl_c_outside_the_steps_stops_at_once(monkeypatch):
+    stop = rt.StopRequest()
+    with pytest.raises(KeyboardInterrupt):
+        stop.on_sigint(2, None)  # not armed: setup or a question on the terminal
+    stop.armed = True
+    stop.on_sigint(2, None)
+    assert stop.requested
+    with pytest.raises(KeyboardInterrupt):
+        stop.on_sigint(2, None)
+
+
+def test_nap_ends_at_the_first_ctrl_c(monkeypatch):
+    monkeypatch.setattr(rt.STOP, "requested", False)
+    threading.Timer(0.3, lambda: setattr(rt.STOP, "requested", True)).start()
+    started = time.monotonic()
+    rt.Runner.nap(30)
+    assert time.monotonic() - started < 5
 
 
 def test_dirty_tree_list_keeps_the_status_columns(basic, capsys):
@@ -1211,7 +1274,7 @@ def test_live_view_status_line_on_a_terminal(basic, capsys, monkeypatch):
     assert basic.run("--once", "--ui", "live") == 0
     out = capsys.readouterr().out
     assert "\x1b[?25l" in out and "\x1b[?25h" in out  # the cursor is hidden, then back
-    assert "ctrl+c stops" in rt.ANSI_RE.sub("", out)
+    assert "ctrl+c stops after this step" in rt.ANSI_RE.sub("", out)
 
 
 def test_live_view_without_color(basic, capsys, monkeypatch):

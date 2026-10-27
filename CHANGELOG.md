@@ -10,6 +10,9 @@ All notable changes to this project are listed here. The format follows
 - After a step that did not finish and left uncommitted edits, the runner asks on a
   terminal: continue with them, set them aside with `git stash` and redo the step, or quit
   (#6). Without a terminal, or with the new `--no-input`, it stops as before.
+- A graceful stop (#7): the first Ctrl+C lets the current step finish and its checks run,
+  then stops before the next step (a failed attempt is not retried); the status line says
+  so. A second Ctrl+C stops at once, as Ctrl+C did before. SIGTERM and SIGHUP stop at once.
 
 ### Fixed
 - In the live view, lines of the agent's output wider than the terminal are wrapped by the
