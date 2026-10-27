@@ -7,6 +7,12 @@ All notable changes to this project are listed here. The format follows
 ## Unreleased
 
 ### Added
+- `runs/report.html`: the whole run on one page for the morning (#11). It shows the outcome,
+  time, cost and branch, then a section per ticket and for the final review. Each step has
+  its result, duration and links to its logs, and the agent's report is rendered from
+  markdown. Retries and stops are highlighted, then the commits and the files changed. It
+  is self-contained and works in light and dark themes. The runner rewrites it after every
+  ticket; `run-tickets report <feature> [--open]` rebuilds it.
 - omp and pi run with `--mode json` (the new `output = "pi-json"`): each tool call shows up
   as it starts, live and in `status`, like Claude's, and their cost is reported and counts
   toward `max_cost` (#10). A config that overrides their `command` without `--mode json`

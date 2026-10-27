@@ -62,8 +62,8 @@ run-tickets config .scratch/my-feature --prompts
 run-tickets run .scratch/my-feature
 ```
 
-In the morning, open `.scratch/my-feature/runs/SUMMARY.md` or run
-`run-tickets status .scratch/my-feature`.
+In the morning, run `run-tickets report .scratch/my-feature --open`: the whole run on one
+page. `run-tickets status .scratch/my-feature` shows the same in the terminal.
 
 **Try it without a model:** clone this repository and run `python examples/demo.py`. It
 creates a throwaway git repository with an example feature (`examples/demo`: a spec and three
@@ -142,6 +142,7 @@ run-tickets retry  <feature> 05             # rerun the step ticket 05 stopped a
 run-tickets reset  <feature> 05             # do 05 again from scratch
 run-tickets skip   <feature> 05 --reason …  # mark 05 wontfix with a comment
 run-tickets adopt  <feature> --feature-base <sha> [--resume 16:review:<sha>]  # take over a feature
+run-tickets report <feature> [--open]       # runs/report.html: the whole run on one page
 run-tickets init   [--agent claude]         # write .ticket-runner.toml in the repo root
 ```
 
@@ -573,8 +574,17 @@ out. A lock left by a dead process is taken over.
 
 ## What to read in the morning
 
+Start with **`runs/report.html`**: the whole run on one page, made for the morning. At the
+top, the outcome, the time and cost, the branch and the commands to look at the work. Below,
+a section per ticket and one for the final review. Each step shows its result, how long it
+took, links to its log and test log, and the agent's report rendered from markdown.
+Retries and stops are highlighted, then the ticket's commits and the files they changed.
+It is a single file with no network access. The runner rewrites it after every ticket;
+`run-tickets report <feature> --open` rebuilds it at any time and opens it.
+
 | File | What is in it |
 |---|---|
+| `runs/report.html` | the page above |
 | `runs/SUMMARY.md` | the outcome: how much is done, where and why it stopped, cost, branch, a table of tickets |
 | `runs/REPORT.md` | an entry per step: result or reason for stopping, duration, cost, tests, commits, suspicious test changes, the model's report |
 | `runs/<ticket>-<step>-<time>.log` | the agent's full output (for `claude`, the whole event stream) |

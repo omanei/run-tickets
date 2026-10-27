@@ -26,6 +26,7 @@ up as a branch in the repository, and pushing it is up to you.
   run-tickets status .scratch/my-feature     # what is done, what is next, what is stuck
   run-tickets config .scratch/my-feature     # effective settings and the agent commands
   run-tickets retry  .scratch/my-feature 05  # rerun the step ticket 05 stopped at
+  run-tickets report .scratch/my-feature     # runs/report.html: the whole run on one page
   run-tickets init                           # write an example .ticket-runner.toml
 
 State survives crashes: <feature>/runs/state.json is rewritten atomically before and
@@ -43,6 +44,7 @@ import atexit
 import contextlib
 import datetime as dt
 import fnmatch
+import html
 import json
 import os
 import re
@@ -57,6 +59,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import webbrowser
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
@@ -2305,6 +2308,11 @@ class Runner:
                          f"{fmt_duration(fe.get('seconds', 0))} | {fmt_cost(fe.get('cost'))} |")
         lines += ["", f"Details: {self.report}", ""]
         atomic_write(self.summary_path, "\n".join(lines))
+        self.state.set(outcome={"outcome": outcome, "detail": detail, "time": iso()})
+        try:
+            write_html_report(self.feature, self.main_git)
+        except Exception as e:  # noqa: BLE001 - the page is a convenience; the run goes on
+            self.event("html_report_failed", error=repr(e))
         short = f"{self.feature.name}: {done}/{len(tickets)} done"
         if outcome != "done" or detail:
             short += f"; {outcome}" + (f" - {detail}" if detail else "")
@@ -2978,7 +2986,7 @@ class Runner:
         if code != EXIT_OK:
             return code
         commits = len(self.git.commits(entry["base"]))
-        self.state.update(ticket.name, commits=commits)
+        self.state.update(ticket.name, commits=commits, done_head=self.git.head())
         self.done_this_run.append((ticket.name, time.monotonic() - started, commits))
         took = fmt_duration(time.monotonic() - started)
         say(f"==> {ticket.name} done: {commits} commit(s)",
@@ -3252,12 +3260,14 @@ class Runner:
             if self.run_cost:
                 lines.append(UI.style(f"  cost {fmt_cost(self.run_cost)}", "gray"))
             lines.append(UI.style(f"summary {UI.path(self.summary_path)}", "gray"))
+            lines.append(UI.style(f"report  {UI.path(self.feature.runs / 'report.html')}", "gray"))
             UI.write("\n" + "\n".join(lines))
             return
         say("\nDone in this run:")
         for name, seconds, commits in self.done_this_run:
             say(f"  {name}: {fmt_duration(seconds)}, {commits} commit(s)")
         say(f"summary: {self.summary_path}")
+        say(f"html report: {self.feature.runs / 'report.html'}")
 
     # -- housekeeping ------------------------------------------------------
 
@@ -3346,7 +3356,353 @@ def print_open(feature: Feature, tickets: List[Ticket]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The morning report: runs/report.html, one self-contained page built from state.json,
+# REPORT.md and git, so it can be rebuilt at any time (`run-tickets report`).
+
+# "## 2026-10-27 09:05 01-first - implement: ok", "## … STOPPED - reason", "## … WORKTREE KEPT"
+REPORT_ENTRY_RE = re.compile(r"^## (\d{4}-\d\d-\d\d \d\d:\d\d) (.+?)(?: - (.*))?$")
+
+
+def parse_report(text: str) -> List[Dict[str, Any]]:
+    """The entries of REPORT.md: one per step result, stop, new tickets and the like."""
+    entries: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        m = REPORT_ENTRY_RE.match(line)
+        if m:
+            when, name, rest = m.groups()
+            rest = rest or ""
+            step, _, result = rest.partition(": ") if ": " in rest else ("", "", rest)
+            entries.append({"time": when, "name": name, "step": step, "result": result or rest,
+                            "facts": [], "commits": [], "suspicious": [], "quote": [], "_in": ""})
+            continue
+        if not entries:
+            continue
+        e = entries[-1]
+        if line.startswith("> ") or line == ">":
+            e["quote"].append(line[2:])
+        elif line.startswith("  - ") and e["_in"]:
+            e[e["_in"]].append(line[4:])
+        elif line.startswith("- "):
+            fact = line[2:]
+            e["_in"] = ("commits" if fact.startswith("commits since") else
+                        "suspicious" if fact.startswith("**check these test changes**") else "")
+            e["facts"].append(fact)
+        elif line.strip() and not e["facts"]:
+            e["quote"].append(line)  # a free-text entry (new tickets, worktree kept)
+    return entries
+
+
+def entry_kind(entry: Dict[str, Any]) -> str:
+    result = entry["result"]
+    if result.startswith("ok"):
+        return "ok"
+    if result.startswith("FAILED"):
+        return "retry"
+    if result.startswith("PROVIDER LIMIT"):
+        return "wait"
+    if "STOPPED" in result or entry["name"].startswith("STOPPED"):
+        return "stop"
+    return "info"
+
+
+def md_to_html(text: str) -> str:
+    """Markdown as agents write it (headings, lists, checkboxes, code, tables, quotes) to
+    HTML, everything escaped."""
+    out: List[str] = []
+    lines = text.splitlines()
+    i = 0
+    para: List[str] = []
+    lists: List[str] = []
+
+    def end_para() -> None:
+        if para:
+            out.append("<p>" + "<br>".join(md_inline(p) for p in para) + "</p>")
+            para.clear()
+
+    def end_lists() -> None:
+        while lists:
+            out.append(f"</{lists.pop()}>")
+
+    while i < len(lines):
+        line = lines[i]
+        fence = re.match(r"^\s*(`{3,}|~{3,})\s*(\S*)\s*$", line)
+        if fence:
+            end_para()
+            end_lists()
+            body = []
+            i += 1
+            while i < len(lines) and not re.match(rf"^\s*{re.escape(fence.group(1)[0])}{{{len(fence.group(1))},}}\s*$", lines[i]):
+                body.append(lines[i])
+                i += 1
+            out.append(f'<pre><code>{html.escape(chr(10).join(body))}</code></pre>')
+            i += 1
+            continue
+        if Markdown.TABLE_RE.match(line) and i + 1 < len(lines) and Markdown.is_separator(lines[i + 1]):
+            end_para()
+            end_lists()
+            rows = [line]
+            i += 2
+            while i < len(lines) and Markdown.TABLE_RE.match(lines[i]):
+                rows.append(lines[i])
+                i += 1
+            cells = [[md_inline(c.strip()) for c in r.strip().strip("|").split("|")] for r in rows]
+            out.append("<table><thead><tr>" + "".join(f"<th>{c}</th>" for c in cells[0]) + "</tr></thead><tbody>"
+                       + "".join("<tr>" + "".join(f"<td>{c}</td>" for c in r) + "</tr>" for r in cells[1:])
+                       + "</tbody></table>")
+            continue
+        heading = Markdown.HEADING_RE.match(line)
+        task = Markdown.TASK_RE.match(line)
+        bullet = Markdown.BULLET_RE.match(line)
+        ordered = Markdown.ORDERED_RE.match(line)
+        quote = Markdown.QUOTE_RE.match(line)
+        if heading:
+            end_para()
+            end_lists()
+            level = min(len(heading.group(1)) + 2, 6)
+            out.append(f"<h{level}>{md_inline(heading.group(2))}</h{level}>")
+        elif Markdown.RULE_RE.match(line):
+            end_para()
+            end_lists()
+            out.append("<hr>")
+        elif task or bullet or ordered:
+            end_para()
+            tag = "ol" if ordered and not (task or bullet) else "ul"
+            if not lists or lists[-1] != tag:
+                end_lists()
+                out.append(f"<{tag}>")
+                lists.append(tag)
+            if task:
+                done = task.group(2) != " "
+                out.append(f'<li class="task {"done" if done else ""}">{"☑" if done else "☐"} '
+                           f'{md_inline(task.group(3))}</li>')
+            elif bullet:
+                out.append(f"<li>{md_inline(bullet.group(2))}</li>")
+            else:
+                out.append(f"<li>{md_inline(ordered.group(4))}</li>")  # type: ignore[union-attr]
+        elif quote:
+            end_para()
+            end_lists()
+            out.append(f"<blockquote>{md_inline(quote.group(2))}</blockquote>")
+        elif not line.strip():
+            end_para()
+            end_lists()
+        else:
+            end_lists()
+            para.append(line.strip())
+        i += 1
+    end_para()
+    end_lists()
+    return "\n".join(out)
+
+
+def md_inline(text: str) -> str:
+    """Inline markdown to HTML: code, emphasis, links (http and https only)."""
+    codes: List[str] = []
+
+    def hold(m: "re.Match[str]") -> str:
+        codes.append(m.group(2))
+        return f"\ue000{len(codes) - 1}\ue001"
+
+    text = html.escape(re.sub(r"(`+)(.+?)\1", hold, text), quote=False)
+    text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)",
+                  lambda m: f'<a href="{html.escape(m.group(2))}">{m.group(1)}</a>', text)
+    tags = {"bold": "strong", "italic": "em", "strike": "s"}
+    for pattern, style in Markdown.EMPHASIS:
+        text = pattern.sub(lambda m, t=tags[style]: f"<{t}>{m.group(1)}</{t}>", text)
+    return re.sub("\ue000(\\d+)\ue001", lambda m: f"<code>{html.escape(codes[int(m.group(1))])}</code>"
+                  if int(m.group(1)) < len(codes) else m.group(0), text)
+
+
+REPORT_CSS = """
+:root { --bg: #ffffff; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --card: #f6f8fa;
+  --ok: #1a7f37; --retry: #9a6700; --stop: #cf222e; --info: #0969da; --code: #eff1f3; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3; --muted: #8d96a0;
+  --line: #30363d; --card: #161b22; --ok: #3fb950; --retry: #d29922; --stop: #f85149;
+  --info: #58a6ff; --code: #1f242c; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 -apple-system,
+  "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 24px; margin: 0 0 4px; } h2 { font-size: 19px; margin: 32px 0 8px; }
+.muted { color: var(--muted); } a { color: var(--info); }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; margin: 16px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.card b { display: block; font-size: 20px; }
+.badge { display: inline-block; border-radius: 999px; padding: 0 8px; font-size: 12px; font-weight: 600;
+  border: 1px solid currentColor; }
+.ok { color: var(--ok); } .retry, .wait { color: var(--retry); } .stop { color: var(--stop); }
+.info { color: var(--info); }
+section.ticket { border: 1px solid var(--line); border-radius: 10px; margin: 16px 0; overflow: hidden; }
+section.ticket > header { background: var(--card); padding: 10px 14px; display: flex; gap: 10px;
+  flex-wrap: wrap; align-items: baseline; }
+section.ticket > header h2 { margin: 0; font-size: 17px; }
+.step { border-top: 1px solid var(--line); padding: 10px 14px; }
+.step.k-retry, .step.k-wait { border-left: 4px solid var(--retry); }
+.step.k-stop { border-left: 4px solid var(--stop); }
+.step > .head { display: flex; gap: 10px; flex-wrap: wrap; align-items: baseline; color: var(--fg); }
+.step .facts { color: var(--muted); font-size: 13px; }
+details > summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 6px; }
+.agent { border-left: 3px solid var(--line); padding: 0 12px; margin-top: 8px; color: var(--fg); }
+pre { background: var(--code); padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 13px; }
+code { background: var(--code); padding: 1px 4px; border-radius: 4px; font-size: 13px; }
+pre code { padding: 0; background: none; }
+table { border-collapse: collapse; margin: 8px 0; display: block; overflow-x: auto; }
+th, td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+li.task { list-style: none; margin-left: -18px; } li.task.done { color: var(--ok); }
+blockquote { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
+ul.commits { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+.warn { color: var(--retry); font-size: 13px; }
+"""
+
+
+def write_html_report(feature: Feature, git: Optional[Git] = None) -> Path:
+    """runs/report.html, rebuilt from what the runs left: state.json, REPORT.md, git."""
+    path = feature.runs / "report.html"
+    atomic_write(path, build_html_report(feature, git))
+    return path
+
+
+def build_html_report(feature: Feature, git: Optional[Git] = None) -> str:
+    esc = html.escape
+    data = load_state_data(feature)
+    report_md = feature.runs / "REPORT.md"
+    entries = parse_report(report_md.read_text(encoding="utf-8", errors="replace")) if report_md.exists() else []
+    with feature.snapshot():
+        tickets = feature.tickets()
+        done = sum(t.status() == DONE for t in tickets)
+        index = feature.by_number()
+        tstate = data["tickets"]
+        cost = sum(e.get("cost", 0) for e in tstate.values())
+        seconds = sum(e.get("seconds", 0) for e in tstate.values())
+        info = data.get("outcome") or {}
+        git_info = data.get("git") or {}
+        branch, base_branch = git_info.get("branch", ""), git_info.get("base_branch", "")
+
+        def link(p: str) -> str:
+            """A link to a file of runs/, relative to the page."""
+            try:
+                rel = Path(p).resolve().relative_to(feature.runs.resolve()).as_posix()
+            except (ValueError, OSError):
+                return esc(p)
+            return f'<a href="{esc(rel)}">{esc(rel)}</a>'
+
+        def entry_html(e: Dict[str, Any]) -> str:
+            kind = entry_kind(e)
+            facts = []
+            for f in e["facts"]:
+                m = re.match(r"(log|transcript): (.+)$", f)
+                if m:
+                    facts.append(f"{m.group(1)} {link(m.group(2))}")
+                    continue
+                m = re.match(r"tests: (\w+) \((.+)\)$", f)
+                if m:
+                    facts.append(f"tests {esc(m.group(1).lower())} · {link(m.group(2))}")
+                    continue
+                if f.startswith("**check these test changes**") or f.startswith("commits since"):
+                    continue
+                facts.append(esc(f))
+            parts = [f'<div class="step k-{kind}"><div class="head"><span class="badge {kind}">'
+                     f'{esc(e["step"] or e["name"])}</span><span>{esc(e["result"])}</span>'
+                     f'<span class="muted">{esc(e["time"])}</span></div>']
+            if facts:
+                parts.append(f'<div class="facts">{" · ".join(facts)}</div>')
+            if e["suspicious"]:
+                parts.append('<div class="warn">check these test changes (skips, ignores, changed constants):'
+                             "<ul>" + "".join(f"<li>{md_inline(c)}</li>" for c in e["suspicious"]) + "</ul></div>")
+            if e["quote"]:
+                body = md_to_html("\n".join(e["quote"]))
+                parts.append(f'<details open><summary>the agent\'s report</summary><div class="agent">{body}</div></details>'
+                             if e["step"] else f'<div class="agent">{body}</div>')
+            parts.append("</div>")
+            return "".join(parts)
+
+        def changes(name: str, entry: Dict[str, Any]) -> str:
+            """The unit's commits (as its last step saw them) and the files they changed."""
+            commits = next((e["commits"] for e in reversed(by_name.get(name, [])) if e["commits"]), [])
+            out = []
+            if commits:
+                out.append(f'<details open><summary>{len(commits)} commit{"" if len(commits) == 1 else "s"}</summary>'
+                           '<ul class="commits">' + "".join(f"<li>{esc(c)}</li>" for c in commits) + "</ul></details>")
+            if git is not None and entry.get("base") and entry.get("done_head"):
+                r = git.run("diff", "--stat=100", entry["base"], entry["done_head"])
+                if r.returncode == 0 and r.stdout.strip():
+                    out.append(f"<details><summary>files changed</summary><pre>{esc(r.stdout.rstrip())}</pre></details>")
+            return f'<div class="step">{"".join(out)}</div>' if out else ""
+
+        by_name: Dict[str, List[Dict[str, Any]]] = {}
+        for e in entries:
+            by_name.setdefault(e["name"], []).append(e)
+
+        sections = []
+        for t in tickets + ([FinalUnit(feature)] if FINAL in tstate or FINAL in by_name else []):
+            final = t.name == FINAL
+            st = tstate.get(t.name) or {}
+            status = st.get("phase", "not started") if final else t.status() or "no status"
+            kind = ("ok" if status == DONE else "stop" if st.get("last_stop") and st.get("phase") != "done"
+                    else "info")
+            head = [f'<span class="badge {kind}">{esc(status)}</span>',
+                    f"<h2>{esc('final review of the whole feature' if final else f'{t.number:02d} {t.title()}')}</h2>"]
+            if not final:
+                total = t.checked() + t.unchecked()
+                if total:
+                    head.append(f'<span class="muted">{t.checked()}/{total} criteria</span>')
+                why = feature.waiting_on(t, index)
+                if why and t.status() not in CLOSED:
+                    head.append(f'<span class="muted">waiting on {esc(", ".join(why))}</span>')
+            bits = []
+            if st.get("seconds"):
+                bits.append(fmt_duration(st["seconds"]))
+            if st.get("commits") is not None:
+                bits.append(f"{st['commits']} commit{'' if st['commits'] == 1 else 's'}")
+            if st.get("cost"):
+                bits.append(fmt_cost(st["cost"]))
+            if bits:
+                head.append(f'<span class="muted">{" · ".join(bits)}</span>')
+            body = "".join(entry_html(e) for e in by_name.get(t.name, []))
+            if not body:
+                body = '<div class="step"><span class="muted">not run yet</span></div>'
+            sections.append(f'<section class="ticket" id="{esc(t.name)}"><header>{"".join(head)}</header>'
+                            f"{body}{changes(t.name, st)}</section>")
+
+        units = {t.name for t in tickets} | {FINAL}
+        run_events = "".join(entry_html(e) for e in entries if e["name"] not in units)
+
+    outcome = info.get("outcome") or ("done" if tickets and done == len(tickets) else "in progress")
+    okind = {"done": "ok", "stopped": "stop", "blocked": "retry", "paused": "retry"}.get(outcome, "info")
+    title = feature.spec_title()
+    cards = [("tickets done", f"{done}/{len(tickets)}"), ("agent time", fmt_duration(seconds)),
+             ("cost", fmt_cost(cost) if cost else "not reported"),
+             ("branch", branch or "the current one")]
+    commands = ""
+    if branch and base_branch:
+        commands = (f"<pre>git log --oneline {esc(base_branch)}..{esc(branch)}\n"
+                    f"git diff {esc(base_branch)}...{esc(branch)}</pre>")
+    page = [
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>{esc(feature.name)} · run-tickets</title><style>{REPORT_CSS}</style></head><body><main>",
+        f"<h1>{esc(feature.name)}</h1>",
+        f'<div class="muted">{esc(title) if title != feature.name else ""}</div>',
+        f'<p><span class="badge {okind}">{esc(outcome)}</span> {esc(info.get("detail", ""))} '
+        f'<span class="muted">· updated {esc((info.get("time") or iso())[:16].replace("T", " "))} '
+        f'· run-tickets {__version__}</span></p>',
+        '<div class="cards">' + "".join(f'<div class="card"><span class="muted">{esc(k)}</span><b>{esc(v)}</b></div>'
+                                       for k, v in cards) + "</div>",
+        commands,
+        *sections,
+        (f"<h2>Run events</h2>{run_events}" if run_events else ""),
+        f'<p class="muted">Built from runs/state.json, <a href="REPORT.md">REPORT.md</a> and git; '
+        f"<code>run-tickets report {esc(str(feature.dir))}</code> rebuilds it.</p>",
+        "</main></body></html>",
+    ]
+    return "\n".join(p for p in page if p)
+
+
+# ---------------------------------------------------------------------------
 # Commands
+
+
+RUN_FILES = (("SUMMARY.md", "summary"), ("REPORT.md", "report"), ("report.html", "html report"))
 
 
 def load_state_data(feature: Feature) -> Dict[str, Any]:
@@ -3425,9 +3781,9 @@ def status_text(feature: Feature) -> List[str]:
     done = sum(1 for t in tickets if t.status() == DONE)
     cost = sum(e.get("cost", 0) for e in data["tickets"].values())
     out.append(f"done: {done}/{len(tickets)}" + (f", cost so far {fmt_cost(cost)}" if cost else ""))
-    for name in ("SUMMARY.md", "REPORT.md"):
+    for name, label in RUN_FILES:
         if (feature.runs / name).exists():
-            out.append(f"{name.split('.')[0].lower()}: {feature.runs / name}")
+            out.append(f"{label}: {feature.runs / name}")
     return out
 
 
@@ -3516,9 +3872,9 @@ def status_live(feature: Feature) -> List[str]:
     nxt = feature.next_ticket()
     out.append("")
     out.append(f"next {UI.style(nxt.name, 'bold') if nxt else UI.style('none runnable', 'yellow')}")
-    for name in ("SUMMARY.md", "REPORT.md"):
+    for name, label in RUN_FILES:
         if (feature.runs / name).exists():
-            out.append(UI.style(f"{name.split('.')[0].lower()} {UI.path(feature.runs / name)}", "gray"))
+            out.append(UI.style(f"{label} {UI.path(feature.runs / name)}", "gray"))
     return out
 
 
@@ -3555,6 +3911,20 @@ def cmd_status(feature: Feature, watch: Optional[float]) -> int:
             time.sleep(watch)
     except KeyboardInterrupt:
         return EXIT_OK
+
+
+def cmd_report(feature: Feature, open_it: bool) -> int:
+    if not feature.runs.exists():
+        raise UsageError(f"{feature.dir} has not been run yet: no runs/ directory")
+    try:
+        git: Optional[Git] = Git(feature.dir)
+    except UsageError:
+        git = None
+    path = write_html_report(feature, git)
+    say(str(path))
+    if open_it:
+        webbrowser.open(path.resolve().as_uri())
+    return EXIT_OK
 
 
 def cmd_init(target: Optional[str], agent: Optional[str]) -> int:
@@ -3752,6 +4122,7 @@ HELP_EPILOG = """examples:
   run-tickets reset  .scratch/my-feature 05   # do 05 again from scratch
   run-tickets skip   .scratch/my-feature 05 --reason "covered by 06"
   run-tickets adopt  .scratch/my-feature --feature-base abc123 --resume 16:review:def456
+  run-tickets report .scratch/my-feature --open  # the morning report in the browser
 
 The feature dir can be given from anywhere; the runner works in the git repo that
 contains it. Config: --config, else .ticket-runner.toml in the feature dir, else in
@@ -3760,7 +4131,7 @@ exit codes: 0 all done, 1 stopped, 2 usage/setup error, 3 open tickets left,
 4 paused, 130 interrupted
 """
 
-COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip", "adopt")
+COMMANDS = ("run", "status", "config", "init", "retry", "reset", "skip", "adopt", "report")
 
 
 def parse_args(argv: List[str]) -> argparse.Namespace:
@@ -3826,6 +4197,10 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         t.add_argument("feature")
         t.add_argument("ticket", help="number (05), name (05-slug), or 'final' for the final review")
         t.add_argument("--reason", default="", help="why (written to the ticket's Comments)")
+
+    rp = sub.add_parser("report", help="write runs/report.html: the whole run on one page")
+    rp.add_argument("feature")
+    rp.add_argument("--open", action="store_true", help="open it in the browser")
 
     a = sub.add_parser("adopt", help="take over a feature another runner started")
     a.add_argument("feature")
@@ -3927,6 +4302,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return cmd_config(Feature(Path(args.feature)), args)
         if args.command == "adopt":
             return cmd_adopt(Feature(Path(args.feature)), args.feature_base, args.resume)
+        if args.command == "report":
+            return cmd_report(Feature(Path(args.feature)), args.open)
         if args.command in ("retry", "reset", "skip"):
             return cmd_ticket(Feature(Path(args.feature)), args.command, args.ticket, args.reason)
         if args.dry_run:
