@@ -44,8 +44,8 @@ the agent that doesn't trust any of that:
 
 It works on **Linux, macOS and Windows** with Python 3.9+ and git. The installer brings the
 one library it uses, `rich`, for highlighted code and tables; a copied file runs without it.
-It drives **Claude Code, Codex, omp and pi** out of the box, and any other
-CLI agent through config. Each step can use its own agent and model.
+It drives **Claude Code, Codex, omp, pi, Gemini CLI, Qwen Code, opencode, Kilo, Cursor, Amp,
+Droid, Copilot CLI and goose** out of the box, and any other CLI agent through config. Each step can use its own agent and model.
 
 ## Quick start
 
@@ -186,8 +186,8 @@ On a terminal the runner shows a live view:
 - a header for each ticket and each step;
 - the agent's output with its markdown rendered: headings, lists, checkboxes, code blocks
   with syntax highlighting, framed tables (both by [rich](https://github.com/Textualize/rich)
-  when it is installed, as it is with uv or pipx), and diffs in color. Claude's tool calls get
-  a line each;
+  when it is installed, as it is with uv or pipx), and diffs in color. Each tool call gets a line of its own
+  as it starts (`▸ bash  npm test`), for the agents that stream JSON events;
 - a line at the end of each step saying whether it passed or failed, and why;
 - a status line at the bottom: the ticket, the step, the attempt, the time it has run, how
   long the agent has been silent, the cost, and progress across the feature (`✓01 ●02 ○03`);
@@ -341,8 +341,8 @@ model = "opus"
 - `max_step_cost`: a limit per step, passed to agents that take one (`--max-budget-usd` for
   `claude`).
 
-Only `claude` reports cost so far. It shows up in REPORT.md and SUMMARY.md, and
-`run-tickets config` warns when the chosen agent's budget does not apply.
+`claude`, `omp`, `pi`, `opencode` and `kilo` report cost. It shows up in REPORT.md and
+SUMMARY.md, and `run-tickets config` warns when the chosen agent's budget does not apply.
 
 ### Protected paths and weakened tests
 
@@ -441,12 +441,26 @@ Files are not merged: the first one found is used.
 
 | `agent` | What runs | Skill call |
 |---|---|---|
-| `omp` | `omp -p --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
-| `pi` | `pi -p --session-dir … "<prompt>"` | `/skill:implement …` |
+| `omp` | `omp -p --mode json --auto-approve --session-dir … --cwd … "<prompt>"` | `/skill:implement …` |
+| `pi` | `pi -p --mode json --session-dir … "<prompt>"` | `/skill:implement …` |
 | `claude` | `claude -p --output-format stream-json --verbose --permission-mode bypassPermissions`, prompt on stdin | `/implement …` |
 | `codex` | `codex exec --dangerously-bypass-approvals-and-sandbox -C … -` | in words |
+| `gemini` | `gemini --approval-mode yolo --skip-trust --output-format stream-json -p "<prompt>"` | in words |
+| `qwen` | `qwen --yolo --output-format stream-json -p "<prompt>"` | `/implement …` |
+| `opencode` | `opencode run --format json --dangerously-skip-permissions "<prompt>"` | in words |
+| `kilo` | `kilo run --format json --dangerously-skip-permissions "<prompt>"` | in words |
+| `cursor` | `cursor-agent -p --force --output-format stream-json "<prompt>"` | in words |
+| `amp` | `amp --dangerously-allow-all --stream-json -x "<prompt>"` (`model` is the mode: smart, rush, deep) | in words |
+| `droid` | `droid exec --auto high "<prompt>"` | in words |
+| `copilot` | `copilot --allow-all-tools --no-ask-user -p "<prompt>"` | in words |
+| `goose` | `goose run --no-session -t "<prompt>"` | in words |
 
-The `codex` preset is experimental.
+`omp`, `pi` and `claude` are the presets in daily use. The others are experimental: they are
+made from each tool's documentation, and a flag may have changed since. `run-tickets config`
+prints the exact command and says so; if a flag is wrong, set the command in
+`[agents.<name>]` (below), and please open an issue. Tool calls show up live for `omp`, `pi`,
+`claude`, `gemini`, `qwen`, `opencode`, `kilo`, `cursor` and `amp`, which stream JSON events;
+cost is reported by `omp`, `pi`, `claude` and `opencode`/`kilo`.
 
 An agent needs three things: a non-interactive mode, no approval prompts, and the skills
 installed. Your own agent, or a changed preset:
@@ -458,7 +472,7 @@ model_args = ["--model", "{{model}}"]   # at {{model_args}}, only when a model i
 budget_args = []                         # at {{budget_args}}, when max_step_cost is set
 prompt_via = "arg"                       # "arg" or "stdin"
 skill_format = "/{{skill}} {{args}}"     # how the agent calls a skill
-output = "text"                          # or "claude-stream-json"
+output = "text"                          # or claude-stream-json, pi-json, gemini-json, opencode-json
 markdown = true                          # false: show its output raw in the live view
 export_command = []                      # HTML transcript export, if the agent has one
 ```
@@ -620,7 +634,8 @@ out of your checkout. Only a container gives full isolation.
 **Limitations:**
 - a review looks at `since <base>`, so commits that land on the branch between steps would be
   included;
-- only `claude` reports cost, so `max_cost` does not apply to the other agents;
+- only `claude`, `omp`, `pi`, `opencode` and `kilo` report cost, so `max_cost` does not apply
+  to the other agents;
 - tickets of one feature run strictly one at a time; there is no parallel mode.
 
 ## Development

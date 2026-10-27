@@ -91,25 +91,28 @@ CONFIG_NAMES = (".ticket-runner.toml",)
 
 # Each preset is a command template. Placeholders: {{prompt}} {{repo}} {{session_dir}}
 # {{final_file}}. model_args are inserted only when a model is set, budget_args only
-# when max_step_cost is set: at a "{{model_args}}" / "{{budget_args}}" item, or else
-# right after the executable. prompt_via: "arg" or "stdin".
+# when max_step_cost is set: at a "{{model_args}}" / "{{budget_args}}" item (after a
+# subcommand such as `run`), or else right after the executable. prompt_via: "arg" or "stdin". output: how the runner reads
+# the agent's stdout - "text" (shown as it is), "claude-stream-json" (Claude Code's
+# --output-format stream-json) or "pi-json" (the --mode json event stream of pi and omp):
+# the JSON kinds show each tool call live and report the cost.
 AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
     "omp": {
-        "command": ["omp", "-p", "--auto-approve", "--session-dir", "{{session_dir}}",
-                    "--cwd", "{{repo}}", "{{prompt}}"],
+        "command": ["omp", "-p", "--mode", "json", "--auto-approve", "--session-dir",
+                    "{{session_dir}}", "--cwd", "{{repo}}", "{{prompt}}"],
         "model_args": ["--model", "{{model}}"],
         "prompt_via": "arg",
         "skill_format": "/skill:{{skill}} {{args}}",
-        "output": "text",
+        "output": "pi-json",
         # Run in the session dir; omp writes omp-session-<name>.html into the cwd.
         "export_command": ["omp", "--export", "{{session_file}}"],
     },
     "pi": {
-        "command": ["pi", "-p", "--session-dir", "{{session_dir}}", "{{prompt}}"],
+        "command": ["pi", "-p", "--mode", "json", "--session-dir", "{{session_dir}}", "{{prompt}}"],
         "model_args": ["--model", "{{model}}"],
         "prompt_via": "arg",
         "skill_format": "/skill:{{skill}} {{args}}",
-        "output": "text",
+        "output": "pi-json",
         "export_command": ["pi", "--export", "{{session_file}}", "{{html_file}}"],
     },
     "claude": {
@@ -133,7 +136,96 @@ AGENT_PRESETS: Dict[str, Dict[str, Any]] = {
         "markdown": False,
         "export_command": [],
     },
+    # Gemini CLI: -p is the prompt and forces one non-interactive run.
+    "gemini": {
+        "command": ["gemini", "--approval-mode", "yolo", "--skip-trust", "--output-format",
+                    "stream-json", "-p", "{{prompt}}"],
+        "model_args": ["-m", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "gemini-json",
+        "export_command": [],
+    },
+    # Qwen Code: a Gemini CLI fork whose stream-json follows Claude Code's.
+    "qwen": {
+        "command": ["qwen", "--yolo", "--output-format", "stream-json", "-p", "{{prompt}}"],
+        "model_args": ["-m", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "/{{skill}} {{args}}",
+        "output": "claude-stream-json",
+        "export_command": [],
+    },
+    "opencode": {
+        "command": ["opencode", "run", "{{model_args}}", "--format", "json",
+                    "--dangerously-skip-permissions", "{{prompt}}"],
+        "model_args": ["-m", "{{model}}"],  # provider/model, e.g. anthropic/claude-sonnet-4-5
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "opencode-json",
+        "export_command": [],
+    },
+    # Kilo CLI: an opencode fork, the same run command and events.
+    "kilo": {
+        "command": ["kilo", "run", "{{model_args}}", "--format", "json",
+                    "--dangerously-skip-permissions", "{{prompt}}"],
+        "model_args": ["-m", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "opencode-json",
+        "export_command": [],
+    },
+    # Cursor CLI: --force lets it change files without asking.
+    "cursor": {
+        "command": ["cursor-agent", "-p", "--force", "--output-format", "stream-json",
+                    "{{prompt}}"],
+        "model_args": ["--model", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "claude-stream-json",
+        "export_command": [],
+    },
+    # Amp: -x runs one prompt; its --stream-json follows Claude Code's. Amp picks models
+    # by mode, so `model` is the mode (smart, rush, deep).
+    "amp": {
+        "command": ["amp", "--dangerously-allow-all", "--stream-json", "-x", "{{prompt}}"],
+        "model_args": ["--mode", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "claude-stream-json",
+        "export_command": [],
+    },
+    # Factory Droid: --auto high allows edits, commands and git without asking.
+    "droid": {
+        "command": ["droid", "exec", "{{model_args}}", "--auto", "high", "{{prompt}}"],
+        "model_args": ["-m", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "text",
+        "export_command": [],
+    },
+    # GitHub Copilot CLI: -p is the prompt; without --allow-all-tools tool calls fail.
+    "copilot": {
+        "command": ["copilot", "--allow-all-tools", "--no-ask-user", "-p", "{{prompt}}"],
+        "model_args": ["--model", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "text",
+        "export_command": [],
+    },
+    "goose": {
+        "command": ["goose", "run", "{{model_args}}", "--no-session", "-t", "{{prompt}}"],
+        "model_args": ["--model", "{{model}}"],
+        "prompt_via": "arg",
+        "skill_format": "Use the {{skill}} skill. Arguments: {{args}}",
+        "output": "text",
+        "export_command": [],
+    },
 }
+
+# Presets made from each tool's documentation, not yet run against it by the maintainers:
+# `run-tickets config` says so, and [agents.<name>] fixes a flag that has changed.
+EXPERIMENTAL_AGENTS = ("codex", "gemini", "qwen", "opencode", "kilo", "cursor", "amp", "droid",
+                       "copilot", "goose")
 
 DEFAULT_LIMIT_PATTERNS = [
     r"usage limit", r"rate[ _-]?limit", r"\b429\b", r"quota", r"too many requests",
@@ -1454,6 +1546,8 @@ def resolve_agent(cfg: Dict[str, Any], name: str) -> Dict[str, Any]:
     agent.setdefault("output", "text")
     agent.setdefault("export_command", [])
     agent.setdefault("markdown", True)
+    if agent["output"] not in OUTPUT_KINDS:
+        raise UsageError(f"[agents.{name}] output must be one of {', '.join(OUTPUT_KINDS)}")
     if agent["prompt_via"] not in ("arg", "stdin"):
         raise UsageError(f"[agents.{name}] prompt_via must be 'arg' or 'stdin'")
     return agent
@@ -1534,7 +1628,7 @@ EXAMPLE_CONFIG = '''# run-tickets config: https://github.com/omanei/run-tickets#
 # lines show the defaults; uncomment and change only what your project needs.
 # `run-tickets config <feature dir>` prints the effective values and the agent commands.
 
-agent = "{{init_agent}}"           # omp | pi | claude | codex, or a name under [agents.<name>]
+agent = "{{init_agent}}"           # a preset (`run-tickets init --help` lists them) or [agents.<name>]
 # model = ""                # passed to the agent (its model_args) when set
 # max_time = "3h"           # per step; the runner kills the agent's process tree after it
 # retries = 1               # fresh-process retries of a failed step before the run stops
@@ -1623,7 +1717,7 @@ agent = "{{init_agent}}"           # omp | pi | claude | codex, or a name under 
 # budget_args = []
 # prompt_via = "arg"                         # or "stdin"
 # skill_format = "/skill:{{skill}} {{args}}"
-# output = "text"                            # or "claude-stream-json"
+# output = "text"                            # or claude-stream-json, pi-json, gemini-json, opencode-json
 # export_command = ["omp", "--export", "{{session_file}}"]
 
 # Replace the prompt templates entirely. Placeholders: {{implement_command}}
@@ -1721,15 +1815,43 @@ def kill_tree(proc: subprocess.Popen) -> None:
             pass
 
 
-def stream_items(line: str) -> List[Tuple[str, str, str]]:
-    """What a claude stream-json line shows: ("text", markdown, ""), ("tool", name, hint)
-    or ("result", summary, "")."""
+OUTPUT_KINDS = ("text", "claude-stream-json", "pi-json", "gemini-json", "opencode-json")
+TOOL_HINT_KEYS = ("description", "command", "file_path", "path", "pattern", "query", "url")
+
+
+def tool_hint(args: Any) -> str:
+    """What a tool call is about, in one line: its command, file or pattern."""
+    if not isinstance(args, dict):
+        return ""
+    hint = next((args[k] for k in TOOL_HINT_KEYS if args.get(k)), "")
+    lines = str(hint).splitlines()
+    return lines[0][:120] if lines else ""
+
+
+def message_cost(message: Any) -> float:
+    try:
+        return float(((message.get("usage") or {}).get("cost") or {}).get("total") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0.0
+
+
+def stream_items(line: str, kind: str = "claude-stream-json") -> List[Tuple[str, str, str]]:
+    """What a line of an agent's JSON event stream shows: ("text", markdown, ""),
+    ("tool", name, hint), ("result", summary, "") or ("note", text, ""). A line that is not
+    JSON is shown as text."""
     try:
         ev = json.loads(line)
     except ValueError:
         return [("text", line.rstrip("\n"), "")]
     if not isinstance(ev, dict):
         return []
+    parse = {"pi-json": pi_items, "gemini-json": gemini_items, "opencode-json": opencode_items}
+    return parse.get(kind, claude_items)(ev)
+
+
+def claude_items(ev: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """Claude Code's --output-format stream-json: an "assistant" event per message, a
+    "result" event at the end."""
     items = []
     message = ev.get("message")
     content = message.get("content") if isinstance(message, dict) else None
@@ -1738,12 +1860,15 @@ def stream_items(line: str) -> List[Tuple[str, str, str]]:
             if not isinstance(c, dict):
                 continue
             if c.get("type") == "tool_use":
-                inp = c.get("input") if isinstance(c.get("input"), dict) else {}
-                hint = inp.get("description") or inp.get("command") or inp.get("file_path") or ""
-                lines = str(hint).splitlines()
-                items.append(("tool", str(c.get("name")), lines[0][:120] if lines else ""))
+                items.append(("tool", str(c.get("name")), tool_hint(c.get("input"))))
             elif c.get("type") == "text" and isinstance(c.get("text"), str) and c["text"].strip():
                 items.append(("text", c["text"].rstrip(), ""))
+    elif ev.get("type") == "tool_call" and ev.get("subtype") == "started":
+        # Cursor: {"tool_call": {"readToolCall": {"args": {"path": ...}}}}
+        call = ev.get("tool_call") if isinstance(ev.get("tool_call"), dict) else {}
+        for name, body in call.items():
+            args = body.get("args") if isinstance(body, dict) else None
+            items.append(("tool", re.sub(r"ToolCall$", "", str(name)), tool_hint(args)))
     elif ev.get("type") == "result":
         try:
             cost = float(ev.get("total_cost_usd") or 0)
@@ -1753,22 +1878,163 @@ def stream_items(line: str) -> List[Tuple[str, str, str]]:
     return items
 
 
-def describe_stream_event(line: str) -> Optional[str]:
-    """One console line of live progress for a claude stream-json event."""
-    parts = [f"  · {a}: {b}" if kind == "tool" else f"  · result: {a}" if kind == "result" else a
-             for kind, a, b in stream_items(line)]
+def pi_items(ev: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """pi's and omp's --mode json: a tool_execution_start per tool call, the finished
+    assistant messages in message_end (message_update only streams their deltas), the
+    run's messages in agent_end."""
+    kind = ev.get("type")
+    if kind == "tool_execution_start":
+        return [("tool", str(ev.get("toolName")), tool_hint(ev.get("args")))]
+    if kind == "message_end":
+        message = ev.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            return []
+        items = [("text", c["text"].rstrip(), "") for c in message.get("content") or []
+                 if isinstance(c, dict) and c.get("type") == "text"
+                 and isinstance(c.get("text"), str) and c["text"].strip()]
+        if message.get("stopReason") in ("error", "aborted") and message.get("errorMessage"):
+            items.append(("note", f"{message.get('stopReason')}: {message['errorMessage']}", ""))
+        return items
+    if kind == "auto_retry_start":
+        return [("note", f"provider error, retry {ev.get('attempt')}/{ev.get('maxAttempts')}: "
+                         f"{ev.get('errorMessage')}", "")]
+    if kind == "agent_end":
+        messages = [m for m in ev.get("messages") or [] if isinstance(m, dict)]
+        replies = [m for m in messages if m.get("role") == "assistant"]
+        cost = sum(message_cost(m) for m in messages)
+        stop = replies[-1].get("stopReason") if replies else "no reply"
+        return [("result", f"{stop}, {len(replies)} turns, ${cost:.2f}", "")]
+    return []
+
+
+def gemini_items(ev: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """Gemini CLI's --output-format stream-json: the reply in "message" chunks (joined by
+    StreamReader), a "tool_use" per tool call, a "result" with the outcome and tokens."""
+    kind = ev.get("type")
+    if kind == "message" and ev.get("role") == "assistant" and isinstance(ev.get("content"), str):
+        return [("chunk" if ev.get("delta") else "text", ev["content"], "")]
+    if kind == "tool_use":
+        return [("tool", str(ev.get("tool_name")), tool_hint(ev.get("parameters")))]
+    if kind == "tool_result" and ev.get("status") == "error":
+        error = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+        return [("note", f"tool error: {error.get('message') or ev.get('output') or ''}".strip(), "")]
+    if kind == "error":
+        return [("note", f"{ev.get('severity') or 'error'}: {ev.get('message')}", "")]
+    if kind == "result":
+        stats = ev.get("stats") if isinstance(ev.get("stats"), dict) else {}
+        error = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+        return [("result", f"{ev.get('status')}, {stats.get('tool_calls', 0)} tool calls, "
+                           f"{stats.get('total_tokens', 0)} tokens"
+                           + (f": {error.get('message')}" if error.get("message") else ""), "")]
+    return []
+
+
+def opencode_items(ev: Dict[str, Any]) -> List[Tuple[str, str, str]]:
+    """opencode's (and Kilo's) `run --format json`: a "tool_use" per finished tool call,
+    "text" per finished reply, "step_finish" with the step's cost, "error"."""
+    part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+    kind = ev.get("type")
+    if kind == "tool_use":
+        state = part.get("state") if isinstance(part.get("state"), dict) else {}
+        items = [("tool", str(part.get("tool")), tool_hint(state.get("input")) or str(state.get("title") or ""))]
+        if state.get("status") == "error":
+            items.append(("note", f"tool error: {state.get('error')}", ""))
+        return items
+    if kind == "text" and isinstance(part.get("text"), str) and part["text"].strip():
+        return [("text", part["text"].rstrip(), "")]
+    if kind == "error":
+        error = ev.get("error")
+        if isinstance(error, dict):
+            data = error.get("data") if isinstance(error.get("data"), dict) else {}
+            error = data.get("message") or error.get("message") or error.get("name")
+        return [("note", f"error: {error}", "")]
+    return []
+
+
+class StreamReader:
+    """Turns the lines of an agent's output into items to show. Gemini sends a reply in
+    chunks: they are joined, and shown when the reply ends (or the output does)."""
+
+    def __init__(self, kind: str):
+        self.kind = kind
+        self.chunks: List[str] = []
+
+    def feed(self, line: str) -> List[Tuple[str, str, str]]:
+        if self.kind == "text":
+            return [("text", line.rstrip("\n"), "")]
+        out: List[Tuple[str, str, str]] = []
+        for item in stream_items(line, self.kind):
+            if item[0] == "chunk":
+                self.chunks.append(item[1])
+                continue
+            out += self.flush()
+            out.append(item)
+        return out
+
+    def flush(self) -> List[Tuple[str, str, str]]:
+        text, self.chunks = "".join(self.chunks), []
+        return [("text", text.rstrip(), "")] if text.strip() else []
+
+
+def describe_stream_event(line: str, kind: str = "claude-stream-json") -> Optional[str]:
+    """One console line of live progress for an event of an agent's JSON stream."""
+    return describe_items(stream_items(line, kind))
+
+
+def describe_items(items: List[Tuple[str, str, str]]) -> Optional[str]:
+    """Plain console lines for stream items."""
+    parts = [f"  · {a}: {b}" if k == "tool" else f"  · result: {a}" if k == "result"
+             else f"  · {a}" if k == "note" else a
+             for k, a, b in items]
     return "\n".join(parts) if parts else None
 
 
-def stream_result(log: Path) -> Tuple[str, bool, Optional[float]]:
-    """(final answer, is_error, cost in USD) from a claude stream-json log."""
+def stream_result(log: Path, kind: str = "claude-stream-json") -> Tuple[str, bool, Optional[float]]:
+    """(final answer, is_error, cost in USD) from the log of an agent's JSON stream."""
     text, is_error, cost = "", False, None
+    reply: List[str] = []  # gemini: the chunks of the reply after the last tool call
     for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
             ev = json.loads(line)
         except ValueError:
             continue
-        if isinstance(ev, dict) and ev.get("type") == "result":
+        if not isinstance(ev, dict):
+            continue
+        if kind == "gemini-json":
+            if ev.get("type") == "message" and ev.get("role") == "assistant":
+                reply = (reply if ev.get("delta") else []) + [str(ev.get("content") or "")]
+            elif ev.get("type") == "tool_use":
+                reply = []
+            elif ev.get("type") == "result":
+                is_error = ev.get("status") == "error"
+                error = ev.get("error") if isinstance(ev.get("error"), dict) else {}
+                if is_error and error.get("message"):
+                    reply = reply + ["\n" + str(error["message"])]
+            text = "".join(reply).strip() or text
+        elif kind == "opencode-json":
+            part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+            if ev.get("type") == "text" and isinstance(part.get("text"), str) and part["text"].strip():
+                text = part["text"].strip()
+            elif ev.get("type") == "step_finish":
+                try:
+                    cost = (cost or 0.0) + float(part.get("cost") or 0)
+                except (TypeError, ValueError):
+                    pass
+        elif kind == "pi-json":
+            message = ev.get("message")
+            if ev.get("type") != "message_end" or not isinstance(message, dict):
+                continue
+            cost = (cost or 0.0) + message_cost(message)
+            if message.get("role") != "assistant":
+                continue
+            reply = "\n\n".join(c["text"] for c in message.get("content") or []
+                                 if isinstance(c, dict) and c.get("type") == "text"
+                                 and isinstance(c.get("text"), str))
+            is_error = message.get("stopReason") in ("error", "aborted")
+            error = str(message.get("errorMessage") or "") if is_error else ""
+            if reply.strip() or error:
+                text = (reply + ("\n" + error if error else "")).strip()
+        elif ev.get("type") == "result":
             text = ev.get("result") or text
             is_error = bool(ev.get("is_error"))
             try:
@@ -1778,11 +2044,11 @@ def stream_result(log: Path) -> Tuple[str, bool, Optional[float]]:
     return text, is_error, cost
 
 
-def last_activity(log: Path, stream: bool) -> str:
+def last_activity(log: Path, kind: str) -> str:
     """The last meaningful line of a step's log, for `status`."""
     lines = [l for l in tail_text(log, 16000).splitlines() if l.strip()]
     for line in reversed(lines):
-        shown = describe_stream_event(line) if stream else line
+        shown = describe_stream_event(line, kind) if kind != "text" else line
         if shown and shown.strip():
             return shown.strip().splitlines()[-1][:160]
     return ""
@@ -2111,7 +2377,8 @@ class Runner:
         atomic_write(runs / "prompts" / f"{stamp}.md", prompt)
 
         argv = self.agent_argv(step, prompt, session_dir, final_file)
-        stream = agent["output"] == "claude-stream-json"
+        output = agent["output"]
+        stream = output != "text"
         who = sc["agent"] + (f" ({sc['model']})" if sc["model"] else "")
         attempts = f"attempt {attempt}/{self.cfg['retries'] + 1}"
         say(f"==> {unit.name}: {step} with {who} (log: {run.log})",
@@ -2120,7 +2387,7 @@ class Runner:
         self.event("agent_start", ticket=unit.name, step=step, log=str(run.log),
                    argv=[a if a != prompt else "<prompt>" for a in argv])
         self.state.set(current={"ticket": unit.name, "step": step, "attempt": attempt,
-                                "started": iso(), "log": str(run.log), "stream": stream,
+                                "started": iso(), "log": str(run.log), "output": output,
                                 "agent": sc["agent"]})
 
         started = time.monotonic()
@@ -2141,6 +2408,7 @@ class Runner:
 
                 proc = self.proc
                 md = Markdown(UI)
+                stream_reader = StreamReader(output)
                 self.last_output = time.monotonic()
 
                 def pump() -> None:
@@ -2153,9 +2421,10 @@ class Runner:
                             self.last_output = time.monotonic()
                             try:
                                 if UI.live:
-                                    self.show_output(md, line, stream, step, agent["markdown"])
+                                    line = line.rstrip("\r\n").split("\r")[-1]  # progress bars redraw with \r
+                                    self.show_output(md, stream_reader.feed(line), step, agent["markdown"])
                                     continue
-                                shown = describe_stream_event(line) if stream else line.rstrip("\n")
+                                shown = describe_items(stream_reader.feed(line)) if stream else line.rstrip("\n")
                                 if shown is not None:
                                     say(shown)
                             except Exception:  # noqa: BLE001 - showing a line must never stop
@@ -2163,12 +2432,17 @@ class Runner:
                                 pass
                     except (OSError, ValueError):
                         pass
-                    if UI.live:
-                        try:
+                    try:  # what the output held back: a reply in chunks, a table, a code block
+                        if UI.live:
+                            self.show_output(md, stream_reader.flush(), step, agent["markdown"])
                             for rendered in md.flush():
                                 self.agent_line(step, rendered)
-                        except Exception:  # noqa: BLE001
-                            pass
+                        else:
+                            shown = describe_items(stream_reader.flush())
+                            if shown is not None:
+                                say(shown)
+                    except Exception:  # noqa: BLE001
+                        pass
 
                 reader = threading.Thread(target=pump, daemon=True)
                 reader.start()
@@ -2205,7 +2479,7 @@ class Runner:
         if final_file.exists() and final_file.stat().st_size:
             run.final = final_file.read_text(encoding="utf-8", errors="replace")
         if stream:
-            text, is_error, run.cost = stream_result(run.log)
+            text, is_error, run.cost = stream_result(run.log, output)
             run.final = run.final or text
             if is_error and run.code == 0:
                 run.code = 1
@@ -2229,11 +2503,10 @@ class Runner:
         for line in wrap(text, UI.width() - 1 - visible_len(gutter)):
             UI.write(gutter + line)
 
-    def show_output(self, md: Markdown, line: str, stream: bool, step: str, markdown: bool) -> None:
-        """One line of the agent's output in the live view: markdown rendered (unless the
+    def show_output(self, md: Markdown, items: List[Tuple[str, str, str]], step: str,
+                    markdown: bool) -> None:
+        """Items of the agent's output in the live view: markdown rendered (unless the
         agent prints raw tool output: markdown = false), tool calls on a line of their own."""
-        line = line.rstrip("\r\n").split("\r")[-1]  # progress bars redraw with \r
-        items = stream_items(line) if stream else [("text", line, "")]
         for kind, a, b in items:
             if kind != "text":
                 for rendered in md.flush():
@@ -2243,6 +2516,8 @@ class Runner:
                          + (" " + UI.style(b, "gray") if b else ""))
             elif kind == "result":
                 self.agent_line(step, UI.style(f"▸ result: {a}", "gray"))
+            elif kind == "note":
+                self.agent_line(step, UI.style(f"▸ {a}", "yellow"))
             else:
                 for sub in a.split("\n"):
                     if "\x1b" in sub and UI.color:  # the agent colors its output: keep the colors only
@@ -3096,7 +3371,8 @@ def running_lines(feature: Feature, data: Dict[str, Any]) -> Tuple[List[str], bo
         except OSError:
             pass
         out.append(line)
-        act = last_activity(log, bool(cur.get("stream")))
+        # "stream": true is how 0.5.0 and older wrote down a claude stream-json step
+        act = last_activity(log, cur.get("output") or ("claude-stream-json" if cur.get("stream") else "text"))
         if act:
             out.append(f"  last: {act}")
     elif running and waiting:
@@ -3340,8 +3616,11 @@ def cmd_config(feature: Feature, args: argparse.Namespace) -> int:
         say(f"  executable: {found}")
         if cfg["max_step_cost"] and not agent["budget_args"]:
             say(f"  note: agent {sc['agent']} takes no budget flag; max_step_cost does not apply")
-        if cfg["max_cost"] and agent["output"] != "claude-stream-json":
+        if cfg["max_cost"] and agent["output"] in ("text", "gemini-json"):
             say(f"  note: agent {sc['agent']} reports no cost; its steps do not count toward max_cost")
+        if sc["agent"] in EXPERIMENTAL_AGENTS and "command" not in (cfg.get("agents") or {}).get(sc["agent"], {}):
+            say(f"  note: the {sc['agent']} preset is experimental (made from its documentation); "
+                f"if a flag has changed, set the command in [agents.{sc['agent']}]")
     if getattr(args, "prompts", False):
         ticket = feature.next_ticket() or (feature.tickets() or [None])[0]
         if ticket is None:
@@ -3501,7 +3780,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
     def overrides(sp: argparse.ArgumentParser) -> None:
         ui_arg(sp)
-        sp.add_argument("--agent", help="omp | pi | claude | codex | a name from the config")
+        sp.add_argument("--agent", help=" | ".join(AGENT_PRESETS) + " | a name from the config")
         sp.add_argument("--model", help="model name passed to the agent")
         sp.add_argument("--max-time", dest="max_time", help="per step, e.g. 3h, 90m (default 3h)")
         sp.add_argument("--retries", type=int, help="fresh-process retries of a failed step (default 1)")

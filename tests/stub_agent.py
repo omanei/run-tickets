@@ -139,7 +139,77 @@ def main():
         print("a long line " + "of many words " * 6)
     if os.environ.get("STUB_ANSI"):  # an agent that colors its own output
         print("\x1b[31mFAILED\x1b[0m one test\x1b[2K, fixed it")
-    if os.environ.get("STUB_STREAM"):  # Claude Code's --output-format stream-json
+    fmt = os.environ.get("STUB_FORMAT")
+    if fmt == "gemini":  # Gemini CLI's --output-format stream-json
+        events = [{"type": "init", "session_id": "s1", "model": "gemini-x"},
+                  {"type": "message", "role": "user", "content": "the prompt"},
+                  {"type": "message", "role": "assistant", "content": "Commit", "delta": True},
+                  {"type": "message", "role": "assistant", "content": "ting.", "delta": True},
+                  {"type": "tool_use", "tool_name": "run_shell_command", "tool_id": "t1",
+                   "parameters": {"command": "git commit"}},
+                  {"type": "tool_result", "tool_id": "t1", "status": "success", "output": "ok"}]
+        for i, piece in enumerate(final.split(" ")):
+            events.append({"type": "message", "role": "assistant", "content": (" " if i else "") + piece,
+                           "delta": True})
+        events.append({"type": "result", "status": "success",
+                       "stats": {"total_tokens": 120, "tool_calls": 1}})
+        for ev in events:
+            print(json.dumps(ev))
+    elif fmt == "opencode":  # opencode's run --format json
+        events = [{"type": "step_start", "part": {"type": "step-start"}},
+                  {"type": "text", "part": {"type": "text", "text": "Committing."}},
+                  {"type": "tool_use", "part": {"type": "tool", "tool": "bash", "state": {
+                      "status": "completed", "input": {"command": "git commit"}, "output": "ok"}}},
+                  {"type": "step_finish", "part": {"type": "step-finish", "cost": 0.2}},
+                  {"type": "text", "part": {"type": "text", "text": final}},
+                  {"type": "step_finish", "part": {"type": "step-finish", "cost": 0.05}}]
+        for ev in events:
+            print(json.dumps(ev))
+    elif fmt == "cursor":  # Cursor's stream-json: Claude's events plus tool_call
+        events = [{"type": "system", "subtype": "init"},
+                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Committing."}]}},
+                  {"type": "tool_call", "subtype": "started", "call_id": "c1",
+                   "tool_call": {"shellToolCall": {"args": {"command": "git commit"}}}},
+                  {"type": "tool_call", "subtype": "completed", "call_id": "c1",
+                   "tool_call": {"shellToolCall": {"args": {"command": "git commit"}, "result": {}}}},
+                  {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": final}]}},
+                  {"type": "result", "subtype": "success", "is_error": False, "result": final}]
+        for ev in events:
+            print(json.dumps(ev))
+    elif os.environ.get("STUB_PI"):  # pi's and omp's --mode json
+        usage = {"input": 10, "output": 5, "totalTokens": 15, "cost": {"total": 0.25}}
+        call = {"type": "toolCall", "id": "c1", "name": "bash", "arguments": {"command": "git commit"}}
+        first = {"role": "assistant", "content": [{"type": "thinking", "thinking": "hmm"},
+                                                  {"type": "text", "text": "Committing."}, call],
+                 "usage": usage, "stopReason": "toolUse"}
+        last = {"role": "assistant", "content": [{"type": "text", "text": final}], "usage": usage,
+                "stopReason": "stop"}
+        result = {"role": "toolResult", "toolCallId": "c1", "toolName": "bash",
+                  "content": [{"type": "text", "text": "[main 1a2b3c] done"}], "isError": False}
+        events = [{"type": "session", "version": 3, "id": "s1", "cwd": cwd}]
+        if os.environ.get("STUB_ODD_EVENTS"):  # shapes the runner does not expect
+            events += [{"type": "message_end", "message": "not a dict"},
+                       {"type": "message_end", "message": {"role": "assistant", "content": [None, {"type": "text"}],
+                                                           "usage": {"cost": "n/a"}}},
+                       {"type": "tool_execution_start", "toolName": None, "args": [1]},
+                       {"type": "agent_end", "messages": "no"}]
+        events += [{"type": "agent_start"}, {"type": "turn_start"},
+                   {"type": "message_end", "message": {"role": "user", "content": "the prompt"}},
+                   {"type": "message_update", "usage": usage,
+                    "assistantMessageEvent": {"type": "text_delta", "contentIndex": 1, "delta": "Commit"}},
+                   {"type": "message_end", "message": first},
+                   {"type": "tool_execution_start", "toolCallId": "c1", "toolName": "bash",
+                    "args": {"command": "git commit"}},
+                   {"type": "tool_execution_end", "toolCallId": "c1", "toolName": "bash", "result": result,
+                    "isError": False},
+                   {"type": "message_end", "message": result},
+                   {"type": "turn_end", "message": first, "toolResults": [result]},
+                   {"type": "message_end", "message": last},
+                   {"type": "agent_end", "messages": [first, result, last], "willRetry": False},
+                   {"type": "agent_settled", "aborted": False}]
+        for ev in events:
+            print(json.dumps(ev))
+    elif os.environ.get("STUB_STREAM"):  # Claude Code's --output-format stream-json
         if os.environ.get("STUB_ODD_EVENTS"):  # shapes the runner does not expect
             print(json.dumps({"type": "assistant", "message": {"content": [
                 "a string", {"type": "text", "text": None}, {"type": "tool_use", "input": [1]}]}}))
