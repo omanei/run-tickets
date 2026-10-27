@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "run-tickets"
-version = "0.3.0"
+version = "0.4.0"
 description = "Run a feature's tickets overnight with a coding agent (Claude Code, Codex, omp, pi): one ticket at a time, a fresh agent per step, every step checked by the runner, resumes after a crash."
 readme = "README.md"
 license = { text = "MIT" }

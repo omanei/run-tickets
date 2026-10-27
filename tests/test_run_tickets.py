@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -914,3 +915,113 @@ def test_the_demo_runs_and_catches_the_agents_slip():
     assert "review failed (1 acceptance criterion is not ticked); retrying" in r.stdout
     assert "export-csv: 3/3 done" in r.stdout
     assert "final review: done" in r.stdout
+
+
+# --- the console ------------------------------------------------------------------
+
+
+def colored():
+    ui = rt.Console()
+    ui.live = ui.color = True
+    return ui
+
+
+def plain_text(lines):
+    return [rt.ANSI_RE.sub("", line) for line in lines]
+
+
+def test_markdown_is_rendered_line_by_line():
+    md = rt.Markdown(colored())
+    src = ["## Step report", "Did **two** things in `src/app.py`:", "- [x] wrote it", "- [ ] shipped it",
+           "  - nested", "1. first", "> quoted", "---", "```python", "x = 1  # **not bold**", "```",
+           "| file | lines |", "|---|---:|", "| a.py | 10 |", "| long_name.py | 2 |", "after"]
+    out = [r for line in src for r in md.feed(line)] + md.flush()
+    text = plain_text(out)
+    assert text[0] == "Step report" and "\x1b[1;34m" in out[0]
+    assert text[1] == "Did two things in src/app.py:"
+    assert "\x1b[1mtwo\x1b[22m" in out[1] and "\x1b[36msrc/app.py\x1b[39m" in out[1]
+    assert text[2:7] == ["✓ wrote it", "○ shipped it", "  ◦ nested", "1. first", "▎ quoted"]
+    assert set(text[7]) == {"─"}
+    assert text[8:11] == ["┌─ python", "│ x = 1  # **not bold**", "└─"]
+    assert text[11:15] == ["file         │ lines", "─────────────┼──────",
+                           "a.py         │ 10   ", "long_name.py │ 2    "]
+    assert text[15] == "after"
+
+
+def test_markdown_without_color_drops_the_markers():
+    ui = rt.Console()
+    ui.live = True
+    md = rt.Markdown(ui)
+    assert md.feed("## **Done**: see [the docs](http://x.io)") == ["Done: see the docs (http://x.io)"]
+    assert md.feed("snake_case_name and 2*3*4") == ["snake_case_name and 2*3*4"]
+
+
+def test_clip_counts_columns_and_keeps_escapes():
+    assert rt.visible_len("\x1b[1mтикет\x1b[22m 日本") == 10
+    clipped = rt.clip("\x1b[32m" + "x" * 50 + "\x1b[39m", 10)
+    assert rt.visible_len(clipped) == 10 and clipped.endswith("…\x1b[0m")
+    assert rt.clip("short", 10) == "short"
+
+
+def test_plain_output_has_no_escape_codes(basic, capsys):
+    assert basic.run("--once") == 0
+    out = capsys.readouterr()
+    assert "\x1b" not in out.out + out.err
+    assert "## Step report" in out.out
+
+
+def test_live_view_renders_the_agents_markdown(basic, capsys):
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    text = rt.ANSI_RE.sub("", out)
+    assert "## Step report" not in text
+    assert "│ Step report" in text and "│ • step: implement 01-first (ok)" in text
+    assert "━━ 01 first" in text
+    assert "✓ implement passed" in text and "✓ review passed" in text
+    assert "✓ 01 first done · 1 commit" in text
+    assert "Done in this run" in text
+    assert "\x1b[?25h" in out  # the cursor is back after the status line
+
+
+def test_live_view_without_color(basic, capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    assert not re.search(r"\x1b\[[0-9;]*m", out)
+    assert "[implement]" in out
+
+
+def test_live_view_stop_box(basic, capsys):
+    basic.set_plan({"01-first:implement": ["needs-info"]})
+    assert basic.run("--ui", "live") == rt.EXIT_STOPPED
+    text = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "╭─ stopped" in text and "✗ stopped at 01-first (implement)" in text
+    assert "run-tickets retry" in text and " 01" in text
+
+
+def test_live_status_command(basic, capsys):
+    assert basic.run("--once") == 0
+    capsys.readouterr()
+    assert rt.main(["status", str(basic.feature), "--ui", "live"]) == 0
+    text = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "╭─ run-tickets" in text and "1/4 done" in text
+    assert "✓ 01 first" in text
+    assert re.search(r"02 second +0/2 criteria · waiting on 03\n", text)
+    assert "next 03-third" in text
+
+
+def test_live_claude_stream_shows_tool_calls(basic, monkeypatch, capsys):
+    monkeypatch.setenv("STUB_STREAM", "1")
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', 'output = "claude-stream-json"\nskill_format'))
+    assert basic.run("--once", "--ui", "live") == 0
+    out = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "│ ▸ Bash git commit" in out
+    assert "▸ result: success, 3 turns, $0.50" in out
+
+
+def test_ui_setting_is_checked(basic):
+    basic.write_config(ui="fancy")
+    assert basic.run() == rt.EXIT_USAGE
+    basic.write_config(ui="plain")
+    assert basic.run("--once") == rt.EXIT_OK

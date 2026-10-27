@@ -53,8 +53,11 @@ def main() -> int:
         say("running the tests: passed")
         git(cwd, "add", "src")
         git(cwd, "commit", "-qm", f"{ticket.stem}: {title}")
-        say("committed")
-        say(f"\n## Step report\nImplemented {ticket.stem}; tests pass.")
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=cwd,
+                             capture_output=True, text=True).stdout.strip()
+        say(f"committed {sha}")
+        say(f"\n## Step report\n**Done:** {title.lower()}, in commit `{sha}`.\n\n"
+            "| check | result |\n|---|---|\n| unit tests | 9 passed |\n| lint | clean |")
         return 0
 
     say(f"reviewing {ticket.name}: no findings")

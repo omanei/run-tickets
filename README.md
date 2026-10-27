@@ -15,8 +15,9 @@ It picks up where [Matt Pocock's skills](https://github.com/mattpocock/skills) l
 
 ![demo: three tickets, an agent's slip caught and the step retried, a final review](docs/demo.gif)
 
-*The runner's real output, with a stand-in agent instead of a model. On ticket 02 the agent
-says it is done but leaves a criterion unticked; the runner notices and retries the step.*
+*The runner's real terminal, recorded with a stand-in agent instead of a model. On ticket 02
+the agent says it is done but leaves a criterion unticked; the runner notices and retries
+the step. The line at the bottom shows what runs now and how far the feature has got.*
 
 ## Why
 
@@ -149,6 +150,7 @@ run-tickets init   [--agent claude]         # write .ticket-runner.toml in the r
 | `--no-final-review` | skip the review of the whole feature |
 | `--pause-after 03` | stop after ticket 03 |
 | `--config <file>` | use this config file |
+| `--ui live` / `--ui plain` | the live view or plain lines (also for `status`) |
 
 `run` only:
 - `--keep-going`: with several features, go on to the next after a stop;
@@ -168,6 +170,22 @@ Exit codes:
 | `3` | nothing runnable, but tickets are still open |
 | `4` | paused (`pause_after`) |
 | `130` | interrupted |
+
+### What you see in the terminal
+
+On a terminal the runner shows a live view:
+- a header for each ticket and each step;
+- the agent's output with its markdown rendered: headings, lists, checkboxes, code blocks
+  and tables. Claude's tool calls get a line each;
+- a line at the end of each step saying whether it passed or failed, and why;
+- a status line at the bottom: the ticket, the step, the attempt, the time it has run, how
+  long the agent has been silent, the cost, and progress across the feature (`✓01 ●02 ○03`);
+- a box at the end: done, stopped, paused or blocked, with the command to go on.
+
+When the output goes to a file or a pipe (`> run.out`, CI), the runner prints plain lines
+with no escape codes, so the log reads well. `--ui live` or `--ui plain` (or
+`ui = "..."` in the config, or `RUN_TICKETS_UI`) forces one or the other. `NO_COLOR=1` keeps
+the live view and drops the colors.
 
 ### Overnight runs
 
@@ -399,6 +417,7 @@ Files are not merged: the first one found is used.
 | `preflight` | `[]` | commands that must pass before the run and before each ticket |
 | `notify_command` | `""` | notification command |
 | `desktop_notify` | `true` | system notifications |
+| `ui` | `"auto"` | `live` (colors, rendered markdown, a status line), `plain`, or `auto`: live on a terminal, plain when piped |
 | `extra_instructions` | `""` | project rules for implement and review |
 | `review_extra_instructions` | `""` | rules for review (and verify) only |
 | `final_review_extra_instructions` | `""` | rules for the final review |
@@ -612,8 +631,8 @@ The tests run the real runner against a stub agent (`tests/stub_agent.py`). They
 CI (`.github/workflows/test.yml`) runs them on Linux, macOS and Windows with Python 3.9 and
 3.13.
 
-The GIF at the top is recorded from a real run of the demo: `python examples/record_demo.py`
-(needs Pillow).
+The GIF at the top is recorded from a real run of the demo in a pseudo-terminal:
+`python examples/record_demo.py` (Linux or macOS; needs `pillow` and `pyte`).
 
 See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
 
