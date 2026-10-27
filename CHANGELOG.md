@@ -4,6 +4,25 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+- After a step that did not finish and left uncommitted edits, the runner asks on a
+  terminal: continue with them, set them aside with `git stash` and redo the step, or quit
+  (#6). Without a terminal, or with the new `--no-input`, it stops as before.
+- A graceful stop (#7): the first Ctrl+C lets the current step finish and its checks run,
+  then stops before the next step (a failed attempt is not retried); the status line says
+  so. A second Ctrl+C stops at once, as Ctrl+C did before. SIGTERM and SIGHUP stop at once.
+
+### Fixed
+- In the live view, lines of the agent's output wider than the terminal are wrapped by the
+  runner, so every screen line keeps the step's gutter and the rest of a list item lines
+  up under its text. Styles open at a break go on in the next line.
+- Emphasis around inline code (`**the commit `abc123`**`) is rendered.
+- The list of uncommitted files kept losing the leading space of its first line, and
+  the check of `protected` paths read the first uncommitted file's name without its
+  first letter (#9).
+
 ## 0.4.0 - 2026-10-27
 
 ### Added

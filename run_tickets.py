@@ -256,6 +256,32 @@ class Interrupted(Exception):
     pass
 
 
+class StopRequest:
+    """Ctrl+C during a run: the first press lets the current step finish and its checks
+    run, then the runner stops with the state clean; the second press stops it at once.
+    Outside the loop of steps (setup, a question on the terminal) Ctrl+C stops at once."""
+
+    def __init__(self) -> None:
+        self.armed = False  # the loop of steps runs
+        self.requested = False
+
+    def reset(self) -> None:
+        self.__init__()  # type: ignore[misc]
+
+    def on_sigint(self, _signum: int, _frame: Any) -> None:
+        if not self.armed or self.requested:
+            raise KeyboardInterrupt
+        self.requested = True
+        if not UI.live:  # the live view's status line says it
+            try:
+                print("\n==> stopping after this step; Ctrl+C again stops now", flush=True)
+            except Exception:  # noqa: BLE001 - print may be busy in the interrupted code
+                pass
+
+
+STOP = StopRequest()
+
+
 def now() -> dt.datetime:
     return dt.datetime.now().astimezone()
 
@@ -375,6 +401,59 @@ def clip(text: str, width: int) -> str:
         used += w
         i += 1
     return "".join(out) + "…" + ("\x1b[0m" if "\x1b" in text else "")
+
+
+HANGING_RE = re.compile(r"^(\s*(?:[•◦▪✓○▎]|\d+[.)]|│)?\s*)")  # what a wrapped line's rest aligns under
+
+
+def wrap(text: str, width: int) -> List[str]:
+    """`text` broken into lines of at most `width` columns, at a space where there is
+    one. The rest of a list item lines up under its text, not under the bullet. Escape
+    codes are kept, and the styles open at a break are reopened on the next line."""
+    if visible_len(text) <= width:
+        return [text]
+    indent = min(visible_len(HANGING_RE.match(ANSI_RE.sub("", text)).group(1)),  # type: ignore[union-attr]
+                 width // 2)
+    tokens: List[Tuple[str, int]] = []
+    i = 0
+    while i < len(text):
+        m = ANSI_RE.match(text, i)
+        if m:
+            tokens.append((m.group(0), 0))
+            i = m.end()
+        else:
+            tokens.append((text[i], char_width(text[i])))
+            i += 1
+    lines: List[str] = []
+    styles = ""  # escape codes in effect where the current line starts
+    cur: List[Tuple[str, int]] = []
+    used = 0
+
+    def emit(part: List[Tuple[str, int]], last: bool) -> None:
+        nonlocal styles
+        body = "".join(t for t, _ in part)
+        lead = " " * indent if lines else ""
+        lines.append(lead + styles + body + ("" if last or not (styles or "\x1b" in body) else "\x1b[0m"))
+        for t, _ in part:
+            if SGR_RE.fullmatch(t):
+                styles = "" if t in ("\x1b[0m", "\x1b[m") else styles + t
+
+    for tok, w in tokens:
+        room = width - (indent if lines else 0)
+        if tok == " " and used + 1 > room and used:  # the line is full right before a space
+            emit(cur, False)
+            cur, used = [], 0
+            continue
+        if w and used + w > room and used:
+            spaces = [k for k, (t, _) in enumerate(cur) if t == " " and k > 0]
+            cut = spaces[-1] if spaces and sum(x for _, x in cur[:spaces[-1]]) > room // 3 else None
+            head, tail = (cur[:cut], cur[cut + 1:]) if cut is not None else (cur, [])
+            emit(head, False)
+            cur, used = tail, sum(x for _, x in tail)
+        cur.append((tok, w))
+        used += w
+    emit(cur, True)
+    return lines
 
 
 def enable_vt() -> bool:
@@ -612,6 +691,13 @@ def warn(msg: str) -> None:
         print(msg, file=sys.stderr, flush=True)
 
 
+def stop_hint() -> str:
+    """What Ctrl+C does now, for the status line."""
+    if STOP.requested:
+        return UI.style("stopping after this step · ctrl+c again stops now", "yellow", "bold")
+    return UI.style("ctrl+c stops after this step", "gray")
+
+
 class Markdown:
     """Renders markdown for the terminal line by line, as an agent prints it."""
 
@@ -771,23 +857,26 @@ class Markdown:
 
     def inline(self, text: str) -> str:
         st = self.ui.style
+        # Code spans first, as placeholders: nothing inside them is markdown, and emphasis
+        # around them (**the commit `abc123`**) still pairs up.
+        codes: List[str] = []
+
+        def hold(m: "re.Match[str]") -> str:
+            codes.append(m.group(2))
+            return f"{len(codes) - 1}"
+
+        text = re.sub(r"(`+)(.+?)\1", hold, text)
         out = []
-        for i, part in enumerate(re.split(r"(`+)(.+?)\1", text)):
-            kind = i % 3  # re.split with two groups: text, the backticks, the code
-            if kind == 1:
-                continue
-            if kind == 2:
-                out.append(st(part, "cyan"))
-                continue
-            # Links: text, label, url, text, ...; the url is printed as it is.
-            pieces = re.split(r"\[([^\]\n]+)\]\(([^)\s]+)\)", part)
-            for j in range(0, len(pieces), 3):
-                out.append(self.emphasis(pieces[j]))
-                if j + 2 < len(pieces):
-                    label, url = pieces[j + 1], pieces[j + 2]
-                    out.append(st(self.emphasis(label), "underline")
-                               + (st(f" ({url})", "gray") if url != label else ""))
-        return "".join(out)
+        # Links: text, label, url, text, ...; the url is printed as it is.
+        pieces = re.split(r"\[([^\]\n]+)\]\(([^)\s]+)\)", text)
+        for j in range(0, len(pieces), 3):
+            out.append(self.emphasis(pieces[j]))
+            if j + 2 < len(pieces):
+                label, url = pieces[j + 1], pieces[j + 2]
+                out.append(st(self.emphasis(label), "underline")
+                           + (st(f" ({url})", "gray") if url != label else ""))
+        return re.sub("(\\d+)", lambda m: st(codes[int(m.group(1))], "cyan")
+                      if int(m.group(1)) < len(codes) else m.group(0), "".join(out))
 
     def emphasis(self, text: str) -> str:
         for pattern, style in self.EMPHASIS:
@@ -1105,11 +1194,15 @@ class Git:
     def run(self, *args: str) -> subprocess.CompletedProcess:
         return self._run(list(args), cwd=self.repo)
 
-    def out(self, *args: str) -> str:
+    def out(self, *args: str, keep_indent: bool = False) -> str:
         r = self.run(*args)
         if r.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
-        return r.stdout.strip()
+        return r.stdout.rstrip() if keep_indent else r.stdout.strip()
+
+    def porcelain(self, *args: str) -> str:
+        """`git status --porcelain`: the leading space of " M file" is part of each line."""
+        return self.out("status", "--porcelain", *args, keep_indent=True)
 
     def head(self) -> str:
         r = self.run("rev-parse", "--verify", "-q", "HEAD")
@@ -1134,15 +1227,15 @@ class Git:
     def tracked_changes(self, exclude: Optional[str] = None) -> str:
         """Uncommitted changes to tracked files, ignoring `exclude` (the feature dir,
         relative to the repo root: the agent edits the ticket, the runner writes runs/)."""
-        args = ["status", "--porcelain", "--untracked-files=no", "--", "."]
+        args = ["--untracked-files=no", "--", "."]
         if exclude:
             args.append(":(exclude)" + exclude)
-        return self.out(*args)
+        return self.porcelain(*args)
 
     def changed_files(self, since: str) -> List[str]:
         """Files changed in commits since `since` plus uncommitted tracked changes."""
         files = set(self.out("diff", "--name-only", f"{since}..HEAD").splitlines())
-        for line in self.out("status", "--porcelain", "--untracked-files=no").splitlines():
+        for line in self.porcelain("--untracked-files=no").splitlines():
             files.add(line[3:].split(" -> ")[-1].strip('"'))
         return sorted(f for f in files if f)
 
@@ -2073,7 +2166,7 @@ class Runner:
                     if UI.live:
                         try:
                             for rendered in md.flush():
-                                UI.write(self.gutter(step) + rendered)
+                                self.agent_line(step, rendered)
                         except Exception:  # noqa: BLE001
                             pass
 
@@ -2129,6 +2222,13 @@ class Runner:
     def gutter(step: str) -> str:
         return "  " + UI.style("│", STEP_COLORS.get(step, "gray")) + " "
 
+    def agent_line(self, step: str, text: str) -> None:
+        """A line of the agent's output behind the step's gutter, wrapped here rather than
+        by the terminal, so that every screen line keeps the gutter."""
+        gutter = self.gutter(step)
+        for line in wrap(text, UI.width() - 1 - visible_len(gutter)):
+            UI.write(gutter + line)
+
     def show_output(self, md: Markdown, line: str, stream: bool, step: str, markdown: bool) -> None:
         """One line of the agent's output in the live view: markdown rendered (unless the
         agent prints raw tool output: markdown = false), tool calls on a line of their own."""
@@ -2137,24 +2237,24 @@ class Runner:
         for kind, a, b in items:
             if kind != "text":
                 for rendered in md.flush():
-                    UI.write(self.gutter(step) + rendered)
+                    self.agent_line(step, rendered)
             if kind == "tool":
-                UI.write(self.gutter(step) + UI.style("▸ ", "cyan") + UI.style(a, "bold")
+                self.agent_line(step, UI.style("▸ ", "cyan") + UI.style(a, "bold")
                          + (" " + UI.style(b, "gray") if b else ""))
             elif kind == "result":
-                UI.write(self.gutter(step) + UI.style(f"▸ result: {a}", "gray"))
+                self.agent_line(step, UI.style(f"▸ result: {a}", "gray"))
             else:
                 for sub in a.split("\n"):
                     if "\x1b" in sub and UI.color:  # the agent colors its output: keep the colors only
                         kept = ANSI_RE.sub(lambda m: m.group(0) if SGR_RE.fullmatch(m.group(0)) else "", sub)
-                        UI.write(self.gutter(step) + kept + "\x1b[0m")
+                        self.agent_line(step, kept + "\x1b[0m")
                         continue
                     sub = ANSI_RE.sub("", sub)
                     if not markdown:
-                        UI.write(self.gutter(step) + sub)
+                        self.agent_line(step, sub)
                         continue
                     for rendered in md.feed(sub):
-                        UI.write(self.gutter(step) + rendered)
+                        self.agent_line(step, rendered)
 
     def show_step_result(self, unit: Any, step: str, run: StepRun) -> None:
         bits = [fmt_duration(run.seconds)]
@@ -2191,15 +2291,14 @@ class Runner:
         if self.run_cost:
             bits.append(fmt_cost(self.run_cost))
         spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], color, "bold")
-        return [f"{spin} " + UI.style(" · ", "gray").join(bits),
-                f"  {board}" + UI.style("   ctrl+c stops; run it again to resume", "gray")]
+        return [f"{spin} " + UI.style(" · ", "gray").join(bits), f"  {board}   " + stop_hint()]
 
     def waiting_status(self, what: str, until: float) -> Callable[[int], List[str]]:
         def status(frame: int) -> List[str]:
             left = max(0, until - time.monotonic())
             spin = UI.style(Console.SPINNER[frame % len(Console.SPINNER)], "yellow")
             return [f"{spin} {what} · {fmt_duration(left)} left",
-                    UI.style("  ctrl+c stops; run it again to resume", "gray")]
+                    "  " + stop_hint()]
         return status
 
     def export_transcript(self, agent: Dict[str, Any], session_dir: Path, stamp: str) -> Optional[Path]:
@@ -2413,7 +2512,17 @@ class Runner:
             pending = [n for n, e in self.state.data["tickets"].items()
                        if e.get("phase") in TICKET_PHASES + ("final",)
                        and (e.get("running") or e.get("last_stop"))]
-            if not (pending and self.opts.adopt_dirty):
+            choice = ""
+            if pending and self.opts.adopt_dirty:
+                choice = "c"
+            elif pending and self.can_ask():
+                choice = self.ask_dirty(pending[0], dirty)
+            if choice == "s" and not self.set_aside(pending[0]):
+                choice = "q"
+            if choice == "q":
+                say("nothing changed; run the same command again to choose again")
+                return EXIT_USAGE
+            if not choice:
                 warn(f"the working tree {self.git.repo} has uncommitted changes; commit or stash them first:")
                 warn(dirty)
                 if pending:
@@ -2425,7 +2534,10 @@ class Runner:
         if pre:
             return self.stop(None, "preflight", pre)
 
+        STOP.armed = True  # from here the first Ctrl+C waits for the end of the step
         while True:
+            if STOP.requested:
+                return self.stopped_on_request()
             ticket = self.feature.next_ticket()
             if ticket is None:
                 return self.finish()
@@ -2436,6 +2548,75 @@ class Runner:
             if self.opts.once:
                 self.print_done()
                 return EXIT_OK
+
+    @staticmethod
+    def nap(seconds: float) -> None:
+        """A pause that the first Ctrl+C ends: no step runs, so there is nothing to wait for."""
+        end = time.monotonic() + seconds
+        while not STOP.requested and time.monotonic() < end:
+            time.sleep(min(0.2, max(0.0, end - time.monotonic())))
+
+    def stopped_on_request(self, unit: Any = None, step: str = "", failure: str = "") -> int:
+        """Ctrl+C was pressed once and the step it came in has ended: stop before the next
+        one. The state says where to go on; a failed attempt's reason goes to the next run."""
+        where = f"{unit.name} ({step})" if unit is not None else "the next ticket"
+        if unit is not None:
+            self.state.update(unit.name, phase=step, running=False,
+                              last_stop={"step": step, "reason": f"{failure} (not retried: Ctrl+C)",
+                                         "time": iso()} if failure else None)
+        self.event("stop_requested", ticket=unit.name if unit is not None else None, step=step)
+        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} STOPPED ON REQUEST (Ctrl+C) - before {where}\n\n")
+        self.write_summary("stopped on request", f"before {where}; run the same command to go on")
+        self.print_done()
+        say(f"\nstopped as asked (Ctrl+C), before {where}; the state is saved, run the same "
+            f"command to go on",
+            live="\n" + "\n".join(UI.box([UI.style(f"■ stopped as asked, before {where}", "yellow", "bold"),
+                                           "the state is saved; run the same command to go on"],
+                                          "stopped", "yellow")))
+        return EXIT_INTERRUPTED
+
+    def can_ask(self) -> bool:
+        """Someone is at the terminal to answer (never in a piped, nohup or CI run)."""
+        return (UI.live and UI.tty and not getattr(self.opts, "no_input", False)
+                and sys.stdin is not None and sys.stdin.isatty())
+
+    def ask_dirty(self, name: str, dirty: str) -> str:
+        """What to do with the uncommitted edits a cut-off step left: c, s or q."""
+        phase = (self.state.data["tickets"].get(name) or {}).get("phase", "")
+        lines = [UI.style(f"{name} did not finish its {phase} step; these edits are not committed:",
+                          "yellow", "bold"),
+                 *dirty.splitlines(), "",
+                 f"{UI.style('c', 'bold')}  continue with them (as --adopt-dirty): the agent finishes its own work",
+                 f"{UI.style('s', 'bold')}  set them aside with git stash and redo the step from its last commit",
+                 f"{UI.style('q', 'bold')}  quit, leaving everything as it is"]
+        UI.write("\n" + "\n".join(UI.box(lines, "uncommitted edits", "yellow")))
+        while True:
+            try:
+                answer = input("c / s / q? ").strip().lower()[:1]
+            except (EOFError, KeyboardInterrupt):
+                UI.write("")
+                return "q"
+            if answer in ("c", "s", "q"):
+                return answer
+
+    def set_aside(self, name: str) -> bool:
+        """`git stash` of the working tree's tracked edits, outside the feature dir (the
+        ticket's own edits stay)."""
+        phase = (self.state.data["tickets"].get(name) or {}).get("phase", "")
+        message = f"run-tickets: {name} {phase} unfinished, set aside {now():%Y-%m-%d %H:%M}"
+        r = self.git.run("stash", "push", "-m", message, "--", ".",
+                         *([":(exclude)" + self.exclude] if self.exclude else []))
+        if r.returncode != 0:
+            warn(f"git stash failed: {(r.stderr or r.stdout).strip()}")
+            return False
+        ref = self.git.stash()[:10]
+        say(f"==> set aside as stash@{{0}} ({ref}); `git stash show -p stash@{{0}}` shows it, "
+            f"`git stash pop` brings it back")
+        self.event("dirty_set_aside", ticket=name, stash=ref)
+        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} {name} - uncommitted edits set aside\n\n"
+                                    f"The {phase} step did not finish; its uncommitted edits were stashed "
+                                    f"({ref}, \"{message}\") and the step starts again.\n\n")
+        return True
 
     def recover_finished_step(self) -> Optional[int]:
         """A step that was running when the runner died but whose ticket is already done
@@ -2496,6 +2677,8 @@ class Runner:
             say(f"==> {ticket.name}: resuming at {entry['phase']} (base {entry['base'][:10]})")
 
         pre = self.preflight(ticket.name)
+        if pre and STOP.requested:  # Ctrl+C reached the preflight command too
+            return self.stopped_on_request(ticket, entry["phase"])
         if pre:
             return self.stop(ticket, entry["phase"], pre, None, entry["base"])
         baseline_stop = (entry.get("last_stop") or {}).get("step") == "baseline"
@@ -2551,7 +2734,10 @@ class Runner:
         note = self.resume_note(unit, step, entry)
         attempts = self.cfg["retries"] + 1
         attempt, waited = 0, 0
+        failure = ""  # of the last attempt, for the next run when it stops here
         while True:
+            if STOP.requested:
+                return self.stopped_on_request(unit, step, failure)
             if self.cfg["max_cost"] and self.run_cost >= self.cfg["max_cost"]:
                 return self.stop(unit, step, f"the run's budget is spent: {fmt_cost(self.run_cost)} "
                                              f"of max_cost {fmt_cost(self.cfg['max_cost'])}",
@@ -2570,6 +2756,7 @@ class Runner:
                     self.show_step_result(unit, step, run)
                 return self.step_passed(unit, step, run, entry)
             reason, retryable = failed
+            failure = reason
             if UI.live:
                 UI.write(f"  {UI.style('✗', 'red')} {UI.style(f'{step} failed:', 'red', 'bold')} "
                          f"{reason.splitlines()[0]} {UI.style(fmt_duration(run.seconds), 'gray')}")
@@ -2591,7 +2778,7 @@ class Runner:
                          f"waiting until {until:%H:%M}, then the step goes on")
                 with UI.showing(self.waiting_status(f"waiting for the provider's limit "
                                                     f"(until {until:%H:%M})", time.monotonic() + wait)):
-                    time.sleep(wait)
+                    self.nap(wait)
                 self.state.set(waiting=None)
                 waited += wait
                 note = (f"A previous {step} run of this ticket was cut off by the provider's usage "
@@ -2611,7 +2798,7 @@ class Runner:
                 live=f"  {UI.style('↻', 'yellow')} retrying with a fresh process "
                      f"({attempt}/{attempts - 1})" + (f" in {fmt_duration(delay)}" if delay else ""))
             with UI.showing(self.waiting_status("retrying soon", time.monotonic() + delay)):
-                time.sleep(delay)
+                self.nap(delay)
             note = self.retry_note(step, reason, run)
 
     def triage_new_tickets(self, unit: Any, entry: Dict[str, Any]) -> None:
@@ -2724,7 +2911,7 @@ class Runner:
         path = info.get("worktree")
         if not path:
             return
-        leftovers = self.git.out("status", "--porcelain")
+        leftovers = self.git.porcelain()
         if leftovers:
             msg = (f"keeping the worktree {path}: it has files that are not committed "
                    f"(remove it yourself with `git worktree remove --force {path}`):\n{leftovers}")
@@ -2769,6 +2956,8 @@ class Runner:
             self.state.update(FINAL, phase="final", base=base, branch=self.git.branch(),
                               running=False, started=iso())
         pre = self.preflight("final review")
+        if pre and STOP.requested:  # Ctrl+C reached the preflight command too
+            return self.stopped_on_request(unit, "final")
         if pre:
             return self.stop(unit, "final", pre, None, base)
         if UI.live:
@@ -3336,6 +3525,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     r.add_argument("--dry-run", action="store_true", help="same as the status command")
     r.add_argument("--adopt-dirty", action="store_true",
                    help="after a crash mid-step, let the agent continue with the uncommitted changes")
+    r.add_argument("--no-input", dest="no_input", action="store_true",
+                   help="never ask on the terminal (what to do with a cut-off step's edits)")
 
     s = sub.add_parser("status", help="show tickets, the next one, what runs now and where it stopped")
     s.add_argument("feature")
@@ -3432,6 +3623,7 @@ def run_feature(path: Path, args: argparse.Namespace) -> int:
         runner.notify(f"run-tickets crashed: {e!r}")
         raise
     finally:
+        STOP.armed = False  # the next feature's setup: Ctrl+C stops at once
         work_lock.release()
         feature_lock.release()
 
@@ -3475,7 +3667,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 signal.signal(getattr(signal, name), on_signal)
             except (OSError, ValueError):
                 pass
+    STOP.reset()
+    try:
+        previous_sigint = signal.signal(signal.SIGINT, STOP.on_sigint)
+    except (OSError, ValueError):  # not the main thread
+        previous_sigint = None
+    try:
+        return run_features(args)
+    finally:
+        STOP.reset()
+        if previous_sigint is not None:
+            signal.signal(signal.SIGINT, previous_sigint)
 
+
+def run_features(args: argparse.Namespace) -> int:
     worst = EXIT_OK
     for i, f in enumerate(args.features):
         if len(args.features) > 1:

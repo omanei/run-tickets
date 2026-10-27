@@ -13,6 +13,7 @@ appended to $STUB_CALLS as a JSON line with the full prompt.
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -71,6 +72,18 @@ def main():
         Path(opts["--session-dir"], "session.jsonl").write_text('{"type":"session"}\n')
 
     name = ticket.stem if ticket else "final"
+    if action in ("sigint", "sigint-fail", "sigint-twice"):  # Ctrl+C; the runner is the parent
+        os.kill(os.getppid(), signal.SIGINT)
+        time.sleep(0.5)
+        if action == "sigint-twice":
+            Path(os.environ["STUB_PIDFILE"]).write_text(str(os.getpid()))
+            os.kill(os.getppid(), signal.SIGINT)
+            time.sleep(120)
+            return 0
+        if action == "sigint-fail":
+            print("provider error")
+            return 1
+        action = "ok"
     if action == "exit1":
         print("provider error")
         return 1
@@ -122,6 +135,8 @@ def main():
             text = text.replace("**Status:** ready-for-agent", "**Status:** done")
         ticket.write_text(text, encoding="utf-8")
     final = f"Done.\n\n## Step report\n- step: {step} {name} ({action})"
+    if os.environ.get("STUB_LONG_LINE"):  # wider than the terminal
+        print("a long line " + "of many words " * 6)
     if os.environ.get("STUB_ANSI"):  # an agent that colors its own output
         print("\x1b[31mFAILED\x1b[0m one test\x1b[2K, fixed it")
     if os.environ.get("STUB_STREAM"):  # Claude Code's --output-format stream-json

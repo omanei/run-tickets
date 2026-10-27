@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -329,6 +330,166 @@ def test_adopt_dirty_after_stop(basic):
     assert basic.run("--once") == rt.EXIT_USAGE
     assert basic.run("--once", "--adopt-dirty") == 0
     assert "uncommitted changes in the working tree are its unfinished edits" in basic.calls_list()[1]["prompt"]
+
+
+class FakeTTY:
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def terminal(monkeypatch):
+    """A person at the terminal: answers() sets what they type. Called in the test body:
+    pytest swaps sys.stdout for its capture after the fixtures are set up."""
+    asked = []
+
+    def answers(*typed):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        monkeypatch.setenv("TERM", "xterm")
+        queue = list(typed)
+
+        def fake_input(prompt=""):
+            asked.append(prompt)
+            if not queue:
+                raise EOFError
+            return queue.pop(0)
+        monkeypatch.setattr("builtins.input", fake_input)
+        return asked
+    return answers
+
+
+def stopped_dirty(basic):
+    basic.set_plan({"01-first:implement": ["dirty", "ok"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    assert "half-done" in (basic.repo / "code.txt").read_text()
+
+
+def test_dirty_tree_asks_and_continues(basic, terminal, capsys):
+    stopped_dirty(basic)
+    asked = terminal("x", "c")  # a wrong key is asked again
+    assert basic.run("--once", "--ui", "live") == 0
+    assert len(asked) == 2
+    assert "M code.txt" in rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "are its unfinished edits" in basic.calls_list()[1]["prompt"]
+
+
+def test_dirty_tree_set_aside_and_step_redone(basic, terminal, capsys):
+    stopped_dirty(basic)
+    terminal("s")
+    assert basic.run("--once", "--ui", "live") == 0
+    stashes = git(basic.repo, "stash", "list")
+    assert "run-tickets: 01-first implement unfinished, set aside" in stashes
+    assert "half-done" in git(basic.repo, "stash", "show", "-p", "stash@{0}")
+    assert "unfinished edits" not in basic.calls_list()[1]["prompt"]
+    assert basic.status("01-first") == "done"
+    assert "uncommitted edits set aside" in basic.report()
+    # The ticket file's own edits are never stashed.
+    assert "feat/" not in git(basic.repo, "stash", "show", "--name-only", "stash@{0}")
+
+
+def test_dirty_tree_quit_leaves_everything(basic, terminal):
+    stopped_dirty(basic)
+    terminal("q")
+    assert basic.run("--ui", "live") == rt.EXIT_USAGE
+    assert "half-done" in (basic.repo / "code.txt").read_text()
+    assert len(basic.calls_list()) == 1
+    assert git(basic.repo, "stash", "list") == ""
+
+
+def test_dirty_tree_never_asks_without_input(basic, terminal):
+    stopped_dirty(basic)
+    asked = terminal()
+    assert basic.run("--ui", "live", "--no-input") == rt.EXIT_USAGE
+    assert basic.run("--ui", "plain") == rt.EXIT_USAGE  # plain lines: no questions either
+    assert asked == []
+
+
+posix_only = pytest.mark.skipif(rt.IS_WINDOWS, reason="the stub sends SIGINT to the runner")
+
+
+@posix_only
+def test_first_ctrl_c_lets_the_step_finish(basic, capsys):
+    basic.set_plan({"01-first:implement": ["sigint"]})
+    assert basic.run() == rt.EXIT_INTERRUPTED
+    assert basic.keys() == ["01-first:implement"]  # implement finished and passed its checks
+    entry = basic.state()["01-first"]
+    assert entry["phase"] == "review" and not entry["running"] and not entry.get("last_stop")
+    out = capsys.readouterr().out
+    assert "stopping after this step" in out
+    assert "stopped as asked (Ctrl+C), before 01-first (review)" in out
+    assert "STOPPED ON REQUEST (Ctrl+C) - before 01-first (review)" in basic.report()
+    assert basic.run("--once") == 0  # the next run goes on with the review
+    assert basic.keys() == ["01-first:implement", "01-first:review"]
+    assert "was interrupted" not in basic.calls_list()[1]["prompt"]
+
+
+@posix_only
+def test_failed_attempt_is_not_retried_after_ctrl_c(basic):
+    basic.write_config(retries=2)
+    basic.set_plan({"01-first:implement": ["sigint-fail", "ok"]})
+    assert basic.run() == rt.EXIT_INTERRUPTED
+    assert basic.keys() == ["01-first:implement"]
+    assert basic.state()["01-first"]["last_stop"]["reason"] == "the agent exited with 1 (not retried: Ctrl+C)"
+    assert basic.run("--once") == 0
+    assert "was stopped by the runner: the agent exited with 1" in basic.calls_list()[1]["prompt"]
+
+
+@posix_only
+def test_second_ctrl_c_stops_at_once(basic):
+    basic.set_plan({"01-first:implement": ["sigint-twice", "ok"]})
+    started = time.monotonic()
+    assert basic.run() == rt.EXIT_INTERRUPTED
+    assert time.monotonic() - started < 30  # the agent sleeps for 120 s
+    assert basic.state()["01-first"]["running"]  # cut off mid-step: the next run resumes it
+    time.sleep(1)
+    assert not rt.pid_alive(int(basic.pidfile.read_text()))
+    assert basic.run("--once") == 0
+    assert "was interrupted before it finished" in basic.calls_list()[1]["prompt"]
+
+
+def test_ctrl_c_outside_the_steps_stops_at_once(monkeypatch):
+    stop = rt.StopRequest()
+    with pytest.raises(KeyboardInterrupt):
+        stop.on_sigint(2, None)  # not armed: setup or a question on the terminal
+    stop.armed = True
+    stop.on_sigint(2, None)
+    assert stop.requested
+    with pytest.raises(KeyboardInterrupt):
+        stop.on_sigint(2, None)
+
+
+def test_nap_ends_at_the_first_ctrl_c(monkeypatch):
+    monkeypatch.setattr(rt.STOP, "requested", False)
+    threading.Timer(0.3, lambda: setattr(rt.STOP, "requested", True)).start()
+    started = time.monotonic()
+    rt.Runner.nap(30)
+    assert time.monotonic() - started < 5
+
+
+def test_dirty_tree_list_keeps_the_status_columns(basic, capsys):
+    basic.set_plan({"01-first:implement": ["dirty"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    capsys.readouterr()
+    assert basic.run() == rt.EXIT_USAGE
+    assert "commit or stash them first:\n M code.txt\n" in capsys.readouterr().err
+
+
+def test_changed_files_include_the_first_uncommitted_file(tmp_path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@example.com")
+    git(repo, "config", "user.name", "Test")
+    for name in ("a.txt", "b.txt"):
+        (repo / name).write_text("1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "init")
+    (repo / "a.txt").write_text("2\n")
+    (repo / "b.txt").write_text("2\n")
+    g = rt.Git(repo)
+    assert g.changed_files(g.head()) == ["a.txt", "b.txt"]
+    assert g.tracked_changes().splitlines() == [" M a.txt", " M b.txt"]
 
 
 def test_recovers_step_finished_while_runner_was_dead(basic):
@@ -973,6 +1134,46 @@ def test_markdown_emphasis_and_links():
     assert "\x1b[1mbold\x1b[22m" in out[0] and "\x1b[3mit\x1b[23m" in out[0]
 
 
+def test_markdown_emphasis_around_code():
+    out = rt.Markdown(colored()).feed("**the commit `a2dd24a`** (on top of `10725`)")
+    assert plain_text(out) == ["the commit a2dd24a (on top of 10725)"]
+    assert out[0].startswith("\x1b[1mthe commit \x1b[36ma2dd24a\x1b[39m\x1b[22m")
+
+
+def test_wrap_keeps_lines_in_width_at_spaces():
+    text = "one two three four five six seven eight nine ten"
+    assert rt.wrap(text, 20) == ["one two three four", "five six seven eight", "nine ten"]
+    assert rt.wrap("x" * 25, 10) == ["x" * 10, "x" * 10, "x" * 5]  # no space: a hard break
+    assert rt.wrap("short", 20) == ["short"]
+
+
+def test_wrap_hangs_list_items_and_reopens_styles():
+    ui = colored()
+    item = rt.Markdown(ui).feed("- `superset/models/access_request.py` is the model and the migration")[0]
+    lines = rt.wrap(item, 30)
+    text = plain_text(lines)
+    assert all(rt.visible_len(line) <= 30 for line in lines)
+    assert text[0].startswith("• ") and all(t.startswith("  ") for t in text[1:])
+    assert lines[1].startswith("  \x1b[36m")  # the cut code span goes on in its color
+
+
+def test_wrap_carries_an_open_style_across_the_break():
+    ui = colored()
+    lines = rt.wrap(ui.style("a" * 12, "cyan") + " tail", 10)
+    assert lines[0] == "\x1b[36m" + "a" * 10 + "\x1b[0m"
+    assert lines[1] == "\x1b[36m" + "aa\x1b[39m tail"
+
+
+def test_live_view_wraps_long_agent_lines_behind_the_gutter(basic, capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "40")
+    monkeypatch.setenv("STUB_LONG_LINE", "1")
+    assert basic.run("--once", "--ui", "live") == 0
+    lines = rt.ANSI_RE.sub("", capsys.readouterr().out).splitlines()
+    long = [i for i, l in enumerate(lines) if "│ a long line" in l][0]
+    assert all(len(l) <= 39 for l in lines[long:long + 3])
+    assert lines[long + 1].startswith("  │ ") and "words" in lines[long + 1]
+
+
 def test_markdown_one_line_fence_is_not_a_block():
     md = rt.Markdown(colored())
     assert plain_text(md.feed("```bash ls```")) == ["bash ls"]
@@ -1073,7 +1274,7 @@ def test_live_view_status_line_on_a_terminal(basic, capsys, monkeypatch):
     assert basic.run("--once", "--ui", "live") == 0
     out = capsys.readouterr().out
     assert "\x1b[?25l" in out and "\x1b[?25h" in out  # the cursor is hidden, then back
-    assert "ctrl+c stops" in rt.ANSI_RE.sub("", out)
+    assert "ctrl+c stops after this step" in rt.ANSI_RE.sub("", out)
 
 
 def test_live_view_without_color(basic, capsys, monkeypatch):
