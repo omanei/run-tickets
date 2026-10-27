@@ -1105,11 +1105,15 @@ class Git:
     def run(self, *args: str) -> subprocess.CompletedProcess:
         return self._run(list(args), cwd=self.repo)
 
-    def out(self, *args: str) -> str:
+    def out(self, *args: str, keep_indent: bool = False) -> str:
         r = self.run(*args)
         if r.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
-        return r.stdout.strip()
+        return r.stdout.rstrip() if keep_indent else r.stdout.strip()
+
+    def porcelain(self, *args: str) -> str:
+        """`git status --porcelain`: the leading space of " M file" is part of each line."""
+        return self.out("status", "--porcelain", *args, keep_indent=True)
 
     def head(self) -> str:
         r = self.run("rev-parse", "--verify", "-q", "HEAD")
@@ -1134,15 +1138,15 @@ class Git:
     def tracked_changes(self, exclude: Optional[str] = None) -> str:
         """Uncommitted changes to tracked files, ignoring `exclude` (the feature dir,
         relative to the repo root: the agent edits the ticket, the runner writes runs/)."""
-        args = ["status", "--porcelain", "--untracked-files=no", "--", "."]
+        args = ["--untracked-files=no", "--", "."]
         if exclude:
             args.append(":(exclude)" + exclude)
-        return self.out(*args)
+        return self.porcelain(*args)
 
     def changed_files(self, since: str) -> List[str]:
         """Files changed in commits since `since` plus uncommitted tracked changes."""
         files = set(self.out("diff", "--name-only", f"{since}..HEAD").splitlines())
-        for line in self.out("status", "--porcelain", "--untracked-files=no").splitlines():
+        for line in self.porcelain("--untracked-files=no").splitlines():
             files.add(line[3:].split(" -> ")[-1].strip('"'))
         return sorted(f for f in files if f)
 
@@ -2724,7 +2728,7 @@ class Runner:
         path = info.get("worktree")
         if not path:
             return
-        leftovers = self.git.out("status", "--porcelain")
+        leftovers = self.git.porcelain()
         if leftovers:
             msg = (f"keeping the worktree {path}: it has files that are not committed "
                    f"(remove it yourself with `git worktree remove --force {path}`):\n{leftovers}")

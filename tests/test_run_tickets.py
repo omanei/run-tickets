@@ -331,6 +331,31 @@ def test_adopt_dirty_after_stop(basic):
     assert "uncommitted changes in the working tree are its unfinished edits" in basic.calls_list()[1]["prompt"]
 
 
+def test_dirty_tree_list_keeps_the_status_columns(basic, capsys):
+    basic.set_plan({"01-first:implement": ["dirty"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    capsys.readouterr()
+    assert basic.run() == rt.EXIT_USAGE
+    assert "commit or stash them first:\n M code.txt\n" in capsys.readouterr().err
+
+
+def test_changed_files_include_the_first_uncommitted_file(tmp_path):
+    repo = tmp_path / "r"
+    repo.mkdir()
+    git(repo, "init", "-q")
+    git(repo, "config", "user.email", "t@example.com")
+    git(repo, "config", "user.name", "Test")
+    for name in ("a.txt", "b.txt"):
+        (repo / name).write_text("1\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "init")
+    (repo / "a.txt").write_text("2\n")
+    (repo / "b.txt").write_text("2\n")
+    g = rt.Git(repo)
+    assert g.changed_files(g.head()) == ["a.txt", "b.txt"]
+    assert g.tracked_changes().splitlines() == [" M a.txt", " M b.txt"]
+
+
 def test_recovers_step_finished_while_runner_was_dead(basic):
     assert basic.run("--once") == 0
     # Simulate: the runner died after the agent finished 03's review but before checking it.
