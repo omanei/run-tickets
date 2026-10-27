@@ -1033,7 +1033,8 @@ def test_without_rich_the_plain_renderer_is_used(monkeypatch):
 
 def test_path_arg_quotes_only_when_needed():
     ui = rt.Console()
-    assert ui.path_arg(Path("/srv/feat")) == "/srv/feat"
+    plain = Path("/srv/feat")
+    assert ui.path_arg(plain) == str(plain)  # \srv\feat on Windows
     spaced = Path("/srv/My Projects/feat")
     assert ui.path_arg(spaced) == (f'"{spaced}"' if rt.IS_WINDOWS else "'/srv/My Projects/feat'")
 
