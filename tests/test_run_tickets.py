@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -914,3 +915,248 @@ def test_the_demo_runs_and_catches_the_agents_slip():
     assert "review failed (1 acceptance criterion is not ticked); retrying" in r.stdout
     assert "export-csv: 3/3 done" in r.stdout
     assert "final review: done" in r.stdout
+
+
+# --- the console ------------------------------------------------------------------
+
+
+def colored():
+    ui = rt.Console()
+    ui.live = ui.color = True
+    return ui
+
+
+def plain_text(lines):
+    return [rt.ANSI_RE.sub("", line) for line in lines]
+
+
+def test_markdown_is_rendered_line_by_line():
+    md = rt.Markdown(colored())
+    src = ["## Step report", "Did **two** things in `src/app.py`:", "- [x] wrote it", "- [ ] shipped it",
+           "  - nested", "1. first", "> quoted", "---", "```python", "x = 1  # **not bold**", "```",
+           "| file | lines |", "|---|---:|", "| a.py | 10 |", "| long_name.py | 2 |", "after"]
+    out = [r for line in src for r in md.feed(line)] + md.flush()
+    text = plain_text(out)
+    assert text[0] == "Step report" and "\x1b[1;34m" in out[0]
+    assert text[1] == "Did two things in src/app.py:"
+    assert "\x1b[1mtwo\x1b[22m" in out[1] and "\x1b[36msrc/app.py\x1b[39m" in out[1]
+    assert text[2:7] == ["✓ wrote it", "○ shipped it", "  ◦ nested", "1. first", "▎ quoted"]
+    assert set(text[7]) == {"─"}
+    assert text[8:11] == ["┌─ python", "│ x = 1  # **not bold**", "└─"]
+    assert text[11:15] == ["file         │ lines", "─────────────┼──────",
+                           "a.py         │ 10   ", "long_name.py │ 2    "]
+    assert text[15] == "after"
+
+
+def test_markdown_without_color_drops_the_markers():
+    ui = rt.Console()
+    ui.live = True
+    md = rt.Markdown(ui)
+    assert md.feed("## **Done**: see [the docs](http://x.io)") == ["Done: see the docs (http://x.io)"]
+    assert md.feed("snake_case_name and 2*3*4") == ["snake_case_name and 2*3*4"]
+
+
+@pytest.mark.parametrize("line", [
+    'File "pkg/__init__.py", line 3',
+    "src/*.py and tests/*.py",
+    "see http://h/_a_/ and a_b_c",
+    "2*3*4 = 24",
+])
+def test_markdown_leaves_paths_and_globs_alone(line):
+    assert plain_text(rt.Markdown(colored()).feed(line)) == [line]
+
+
+def test_markdown_emphasis_and_links():
+    md = rt.Markdown(colored())
+    out = md.feed("**bold**, *it*, _it_ and ~~gone~~ in [the docs](http://h/_a_)")
+    assert plain_text(out) == ["bold, it, it and gone in the docs (http://h/_a_)"]
+    assert "\x1b[1mbold\x1b[22m" in out[0] and "\x1b[3mit\x1b[23m" in out[0]
+
+
+def test_markdown_one_line_fence_is_not_a_block():
+    md = rt.Markdown(colored())
+    assert plain_text(md.feed("```bash ls```")) == ["bash ls"]
+    assert plain_text(md.feed("## Next")) == ["Next"]  # still markdown, not code
+
+
+def test_markdown_shows_a_diff_as_a_diff():
+    md = rt.Markdown(colored())
+    src = ["diff --git a/x b/x", "--- a/x", "+++ b/x", "@@ -1,2 +1,2 @@", "-old", "+new", " same",
+           "", "- a bullet again"]
+    out = [r for line in src for r in md.feed(line)]
+    assert plain_text(out[:7]) == src[:7]
+    assert out[4] == "\x1b[31m-old\x1b[39m" and out[5] == "\x1b[32m+new\x1b[39m"
+    assert plain_text(out[8:]) == ["• a bullet again"]
+
+
+RICH_SRC = ["```python", "def f(x):", "    return x  # done", "```",
+            "| name | size |", "|:--|--:|", "| a.py | 10 |", "after"]
+
+
+def feed_all(md, lines):
+    return [r for line in lines for r in md.feed(line)] + md.flush()
+
+
+def test_rich_highlights_code_and_frames_tables():
+    pytest.importorskip("rich")
+    ui = colored()
+    ui.rich = True
+    out = feed_all(rt.Markdown(ui), RICH_SRC)
+    text = [line.rstrip() for line in plain_text(out)]
+    assert text[:4] == ["┌─ python", "│ def f(x):", "│     return x  # done", "└─"]
+    assert len(rt.ANSI_RE.findall(out[1])) > 2  # colored by the syntax highlighter
+    table = "\n".join(text[4:-1])
+    assert "╭" in table and "╰" in table and "name" in table and "a.py" in table
+    assert re.search(r"│ a\.py\s+│\s+10 │", table)  # the second column is right-aligned
+    assert text[-1] == "after"
+
+
+def test_rich_unclosed_code_block_is_shown_at_the_end():
+    pytest.importorskip("rich")
+    ui = colored()
+    ui.rich = True
+    md = rt.Markdown(ui)
+    assert md.feed("```js") and md.feed("let x = 1") == []  # held until the block ends
+    assert [line.rstrip() for line in plain_text(md.flush())] == ["│ let x = 1"]
+    assert plain_text(md.feed("## after")) == ["after"]  # the fence is closed by the flush
+
+
+def test_without_rich_the_plain_renderer_is_used(monkeypatch):
+    monkeypatch.setitem(sys.modules, "rich", None)  # import rich -> ImportError
+    assert not rt.rich_available()
+    ui = colored()
+    ui.rich = True  # even when asked for: the render falls back to plain lines
+    text = plain_text(feed_all(rt.Markdown(ui), RICH_SRC))
+    assert text[:4] == ["┌─ python", "│ def f(x):", "│     return x  # done", "└─"]
+    assert text[4:7] == ["name │ size", "─────┼─────", "a.py │ 10  "]
+
+
+def test_path_arg_quotes_only_when_needed():
+    ui = rt.Console()
+    plain = Path("/srv/feat")
+    assert ui.path_arg(plain) == str(plain)  # \srv\feat on Windows
+    spaced = Path("/srv/My Projects/feat")
+    assert ui.path_arg(spaced) == (f'"{spaced}"' if rt.IS_WINDOWS else "'/srv/My Projects/feat'")
+
+
+def test_clip_counts_columns_and_keeps_escapes():
+    assert rt.visible_len("\x1b[1mтикет\x1b[22m 日本") == 10
+    clipped = rt.clip("\x1b[32m" + "x" * 50 + "\x1b[39m", 10)
+    assert rt.visible_len(clipped) == 10 and clipped.endswith("…\x1b[0m")
+    assert rt.clip("short", 10) == "short"
+
+
+def test_plain_output_has_no_escape_codes(basic, capsys):
+    assert basic.run("--once") == 0
+    out = capsys.readouterr()
+    assert "\x1b" not in out.out + out.err
+    assert "## Step report" in out.out
+
+
+def test_live_view_renders_the_agents_markdown(basic, capsys):
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    text = rt.ANSI_RE.sub("", out)
+    assert "## Step report" not in text
+    assert "│ Step report" in text and "│ • step: implement 01-first (ok)" in text
+    assert "━━ 01 first" in text
+    assert "✓ implement passed" in text and "✓ review passed" in text
+    assert "✓ 01 first done · 1 commit" in text
+    assert "Done in this run" in text
+    # Not a terminal (captured): no status line redrawn into the output.
+    assert "\x1b[J" not in out and "\x1b[?25l" not in out
+
+
+def test_live_view_status_line_on_a_terminal(basic, capsys, monkeypatch):
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setenv("TERM", "xterm")
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    assert "\x1b[?25l" in out and "\x1b[?25h" in out  # the cursor is hidden, then back
+    assert "ctrl+c stops" in rt.ANSI_RE.sub("", out)
+
+
+def test_live_view_without_color(basic, capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    assert not re.search(r"\x1b\[[0-9;]*m", out)
+    assert "[implement]" in out
+
+
+def test_live_view_without_color_strips_the_agents_colors(basic, capsys, monkeypatch):
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("STUB_ANSI", "1")
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    assert "\x1b" not in out
+    assert "│ FAILED one test, fixed it" in out
+
+
+def test_live_view_keeps_the_agents_colors(basic, capsys, monkeypatch):
+    monkeypatch.setenv("STUB_ANSI", "1")
+    assert basic.run("--once", "--ui", "live") == 0
+    out = capsys.readouterr().out
+    assert "\x1b[31mFAILED\x1b[0m one test, fixed it\x1b[0m" in out  # \x1b[2K dropped
+
+
+def test_agent_without_markdown_is_shown_raw(basic, capsys):
+    basic.agent_table += "markdown = false\n"
+    basic.write_config()
+    assert basic.run("--once", "--ui", "live") == 0
+    assert "│ ## Step report" in rt.ANSI_RE.sub("", capsys.readouterr().out)
+
+
+def test_odd_stream_events_do_not_stop_the_reading(basic, monkeypatch, capsys):
+    monkeypatch.setenv("STUB_STREAM", "1")
+    monkeypatch.setenv("STUB_ODD_EVENTS", "1")
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', 'output = "claude-stream-json"\nskill_format'))
+    for ui in ("plain", "live"):
+        assert basic.run("--once", "--ui", ui) == 0
+        assert "result: partial, None turns, $0.00" in rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert basic.keys()[-1] == "03-third:review"
+
+
+def test_status_takes_ui_from_the_config(basic, capsys):
+    (basic.repo / ".ticket-runner.toml").write_text('ui = "live"\n')
+    assert rt.main(["status", str(basic.feature)]) == 0
+    assert "╭─ run-tickets" in rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert rt.main(["status", str(basic.feature), "--ui", "plain"]) == 0
+    assert "╭─" not in capsys.readouterr().out
+
+
+def test_live_view_stop_box(basic, capsys):
+    basic.set_plan({"01-first:implement": ["needs-info"]})
+    assert basic.run("--ui", "live") == rt.EXIT_STOPPED
+    text = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "╭─ stopped" in text and "✗ stopped at 01-first (implement)" in text
+    assert "run-tickets retry" in text and " 01" in text
+
+
+def test_live_status_command(basic, capsys):
+    assert basic.run("--once") == 0
+    capsys.readouterr()
+    assert rt.main(["status", str(basic.feature), "--ui", "live"]) == 0
+    text = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "╭─ run-tickets" in text and "1/4 done" in text
+    assert "✓ 01 first" in text
+    assert re.search(r"02 second +0/2 criteria · waiting on 03\n", text)
+    assert "next 03-third" in text
+
+
+def test_live_claude_stream_shows_tool_calls(basic, monkeypatch, capsys):
+    monkeypatch.setenv("STUB_STREAM", "1")
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', 'output = "claude-stream-json"\nskill_format'))
+    assert basic.run("--once", "--ui", "live") == 0
+    out = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "│ ▸ Bash git commit" in out
+    assert "▸ result: success, 3 turns, $0.50" in out
+
+
+def test_ui_setting_is_checked(basic):
+    basic.write_config(ui="fancy")
+    assert basic.run() == rt.EXIT_USAGE
+    basic.write_config(ui="plain")
+    assert basic.run("--once") == rt.EXIT_OK
