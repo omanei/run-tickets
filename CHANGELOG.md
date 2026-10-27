@@ -4,9 +4,12 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 0.5.0 - 2026-10-27
 
 ### Added
+- On PyPI: `uv tool install run-tickets`, `pipx install run-tickets`, `uvx run-tickets`.
+  Pushing a version tag publishes the release to PyPI and creates the GitHub Release from
+  this changelog (#8).
 - After a step that did not finish and left uncommitted edits, the runner asks on a
   terminal: continue with them, set them aside with `git stash` and redo the step, or quit
   (#6). Without a terminal, or with the new `--no-input`, it stops as before.

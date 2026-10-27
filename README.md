@@ -3,9 +3,10 @@
 [![tests](https://github.com/omanei/run-tickets/actions/workflows/test.yml/badge.svg)](https://github.com/omanei/run-tickets/actions/workflows/test.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![platforms](https://img.shields.io/badge/os-linux%20%7C%20macos%20%7C%20windows-lightgrey)
-[![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![pypi](https://img.shields.io/pypi/v/run-tickets)](https://pypi.org/project/run-tickets/)
+[![license](https://img.shields.io/badge/license-MIT-green)](https://github.com/omanei/run-tickets/blob/master/LICENSE)
 
-**English** | [Русский](README.ru.md)
+**English** | [Русский](https://github.com/omanei/run-tickets/blob/master/README.ru.md)
 
 Run a feature's tickets overnight with a coding agent: one ticket at a time, a fresh agent
 for every step, and every step checked by the runner rather than taken on the agent's word.
@@ -13,7 +14,7 @@ for every step, and every step checked by the runner rather than taken on the ag
 It picks up where [Matt Pocock's skills](https://github.com/mattpocock/skills) leave off:
 `/to-spec` → `/to-tickets` → **run-tickets** → a finished branch in your repository.
 
-![demo: three tickets, an agent's slip caught and the step retried, a final review](docs/demo.gif)
+![demo: three tickets, an agent's slip caught and the step retried, a final review](https://raw.githubusercontent.com/omanei/run-tickets/master/docs/demo.gif)
 
 *The runner's real terminal, recorded with a stand-in agent instead of a model. On ticket 02
 the agent says it is done but leaves a criterion unticked; the runner notices and retries
@@ -49,8 +50,8 @@ CLI agent through config. Each step can use its own agent and model.
 ## Quick start
 
 ```bash
-# 1. Install once (needs uv: https://docs.astral.sh/uv/)
-uv tool install git+https://github.com/omanei/run-tickets
+# 1. Install once (needs uv: https://docs.astral.sh/uv/; or: pipx install run-tickets)
+uv tool install run-tickets
 
 # 2. In your project root: write a config and see what the runner would do
 cd ~/work/my-project
@@ -93,8 +94,8 @@ directory, and it finds the git repository from there, so it runs from anywhere.
 ### 1. As a command (recommended)
 
 ```bash
-uv tool install git+https://github.com/omanei/run-tickets      # or:
-pipx install    git+https://github.com/omanei/run-tickets
+uv tool install run-tickets      # or:
+pipx install run-tickets
 ```
 
 | | uv | pipx |
@@ -105,10 +106,14 @@ pipx install    git+https://github.com/omanei/run-tickets
 If the command is not found after installing, run `uv tool update-shell` or
 `pipx ensurepath` and restart the terminal.
 
+A given version: `uv tool install run-tickets==0.5.0`. The latest, unreleased code from
+`master`: `uv tool install git+https://github.com/omanei/run-tickets` (or `pipx install
+git+https://github.com/omanei/run-tickets`).
+
 ### 2. Without installing
 
 ```bash
-uvx --from git+https://github.com/omanei/run-tickets run-tickets run .scratch/my-feature
+uvx run-tickets run .scratch/my-feature
 ```
 
 ### 3. As a single file in your project
@@ -649,8 +654,22 @@ CI (`.github/workflows/test.yml`) runs them on Linux, macOS and Windows with Pyt
 The GIF at the top is recorded from a real run of the demo in a pseudo-terminal:
 `python examples/record_demo.py` (Linux or macOS; needs `pillow` and `pyte`).
 
-See [CHANGELOG.md](CHANGELOG.md) for what changed between versions.
+See [CHANGELOG.md](https://github.com/omanei/run-tickets/blob/master/CHANGELOG.md) for what changed between versions.
+
+### Releasing
+
+1. In a pull request: set the new version in `run_tickets.py` (`__version__`) and
+   `pyproject.toml`, and give its `CHANGELOG.md` section the version and date
+   (`## 0.5.0 - 2026-10-27`). Merge it.
+2. Tag the merge commit with the bare version and push the tag:
+   `git tag 0.5.0 origin/master && git push origin 0.5.0`.
+
+`.github/workflows/release.yml` then checks that the tag, both versions and the changelog
+agree, runs the tests, builds the package, publishes it to PyPI and creates the GitHub
+Release with the changelog section as its notes. Publishing uses PyPI trusted publishing:
+no token is stored in the repository. Run the workflow by hand (Actions → release → Run
+workflow) to publish the current `master` to TestPyPI as a dry run.
 
 ## License
 
-[MIT](LICENSE).
+[MIT](https://github.com/omanei/run-tickets/blob/master/LICENSE).

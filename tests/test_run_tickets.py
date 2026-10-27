@@ -1361,3 +1361,37 @@ def test_ui_setting_is_checked(basic):
     assert basic.run() == rt.EXIT_USAGE
     basic.write_config(ui="plain")
     assert basic.run("--once") == rt.EXIT_OK
+
+
+# --- releases -------------------------------------------------------------------
+
+
+def release_check():
+    import importlib.util
+    path = ROOT / ".github" / "scripts" / "release_check.py"
+    spec = importlib.util.spec_from_file_location("release_check", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_current_version_is_ready_to_release():
+    notes = release_check().check(rt.__version__)
+    assert notes.startswith("### ")
+    assert "uv tool install run-tickets" in notes
+
+
+def test_release_check_names_every_mismatch(tmp_path):
+    (tmp_path / "run_tickets.py").write_text('__version__ = "1.2.3"\n')
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.2.2"\n')
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n\n## Unreleased\n\n- x\n\n## 1.2.2 - 2026-01-01\n\n- y\n")
+    with pytest.raises(ValueError) as e:
+        release_check().check("1.2.3", tmp_path)
+    assert "version in pyproject.toml is 1.2.2, not 1.2.3" in str(e.value)
+    assert "no '## 1.2.3 - YYYY-MM-DD' section" in str(e.value)
+    with pytest.raises(ValueError, match="not X.Y.Z"):
+        release_check().check("v1.2.3", tmp_path)
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.2.3"\n')
+    (tmp_path / "CHANGELOG.md").write_text("## 1.2.3 - 2026-02-01\n\n### Fixed\n- z\n\n## 1.2.2 - 2026-01-01\n\n- y\n")
+    notes = release_check().check("1.2.3", tmp_path)
+    assert notes.startswith("### Fixed\n- z\n\n### Install") and "- y" not in notes
