@@ -11,6 +11,13 @@ All notable changes to this project are listed here. The format follows
   as it starts, live and in `status`, like Claude's, and their cost is reported and counts
   toward `max_cost` (#10). A config that overrides their `command` without `--mode json`
   keeps working: the output is shown as text.
+- Experimental presets for more agents: `gemini` (Gemini CLI), `qwen` (Qwen Code),
+  `opencode`, `kilo` (Kilo CLI), `cursor` (Cursor CLI), `amp`, `droid` (Factory),
+  `copilot` (GitHub Copilot CLI) and `goose`. They are made from each tool's
+  documentation; `run-tickets config` marks them, and `[agents.<name>]` fixes a flag that
+  has changed. Gemini's, opencode's/Kilo's, Cursor's and Amp's JSON streams are read:
+  tool calls show live, and opencode/Kilo report cost (new `output` kinds `gemini-json`
+  and `opencode-json`).
 
 ## 0.5.0 - 2026-10-27
 

@@ -639,6 +639,69 @@ def test_unknown_output_kind_is_an_error(basic):
     assert basic.run() == rt.EXIT_USAGE
 
 
+@pytest.mark.parametrize("fmt,output,tool,cost", [
+    ("gemini", "gemini-json", "  · run_shell_command: git commit", None),
+    ("opencode", "opencode-json", "  · bash: git commit", 0.5),
+    ("cursor", "claude-stream-json", "  · shell: git commit", None),
+])
+def test_other_agents_streams(basic, monkeypatch, capsys, fmt, output, tool, cost):
+    monkeypatch.setenv("STUB_FORMAT", fmt)
+    text = basic.config.read_text()
+    basic.config.write_text(text.replace('skill_format', f'output = "{output}"\nskill_format'))
+    assert basic.run("--once") == 0
+    out = capsys.readouterr().out
+    assert tool in out and "Committing." in out
+    assert '"type"' not in out
+    assert "> - step: review 01-first (ok)" in basic.report()  # the last reply is the report
+    assert basic.state()["01-first"].get("cost") == (pytest.approx(cost) if cost else None)
+    assert basic.run("--once", "--ui", "live") == 0
+    live = rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "│ ▸ " + tool.split("· ")[1].replace(": ", " ") in live and "│ Step report" in live
+
+
+def test_gemini_chunks_are_joined_into_one_reply():
+    reader = rt.StreamReader("gemini-json")
+    lines = [json.dumps({"type": "message", "role": "assistant", "content": c, "delta": True})
+             for c in ("Hel", "lo **wor", "ld**")]
+    assert [i for line in lines for i in reader.feed(line)] == []
+    tool = json.dumps({"type": "tool_use", "tool_name": "read_file", "parameters": {"file_path": "a.py"}})
+    assert reader.feed(tool) == [("text", "Hello **world**", ""), ("tool", "read_file", "a.py")]
+    assert reader.flush() == []
+
+
+def test_gemini_error_result(tmp_path):
+    log = tmp_path / "step.log"
+    log.write_text("\n".join(json.dumps(e) for e in [
+        {"type": "message", "role": "assistant", "content": "trying", "delta": True},
+        {"type": "result", "status": "error", "error": {"type": "api", "message": "429 quota exceeded"}}]))
+    text, is_error, cost = rt.stream_result(log, "gemini-json")
+    assert is_error and "429 quota exceeded" in text and cost is None
+
+
+@pytest.mark.parametrize("agent,model,expected", [
+    ("gemini", "pro", ["gemini", "-m", "pro", "--approval-mode", "yolo", "--skip-trust", "--output-format",
+                       "stream-json", "-p", "PROMPT"]),
+    ("qwen", "", ["qwen", "--yolo", "--output-format", "stream-json", "-p", "PROMPT"]),
+    ("opencode", "anthropic/x", ["opencode", "run", "-m", "anthropic/x", "--format", "json",
+                                 "--dangerously-skip-permissions", "PROMPT"]),
+    ("opencode", "", ["opencode", "run", "--format", "json", "--dangerously-skip-permissions", "PROMPT"]),
+    ("kilo", "", ["kilo", "run", "--format", "json", "--dangerously-skip-permissions", "PROMPT"]),
+    ("cursor", "", ["cursor-agent", "-p", "--force", "--output-format", "stream-json", "PROMPT"]),
+    ("amp", "rush", ["amp", "--mode", "rush", "--dangerously-allow-all", "--stream-json", "-x", "PROMPT"]),
+    ("droid", "m1", ["droid", "exec", "-m", "m1", "--auto", "high", "PROMPT"]),
+    ("copilot", "", ["copilot", "--allow-all-tools", "--no-ask-user", "-p", "PROMPT"]),
+    ("goose", "", ["goose", "run", "--no-session", "-t", "PROMPT"]),
+])
+def test_preset_argv(tmp_path, monkeypatch, agent, model, expected):
+    argv, _ = _argv(tmp_path, monkeypatch, agent, model)
+    assert argv == ["/bin/" + expected[0]] + expected[1:]
+
+
+def test_config_flags_an_experimental_preset(basic, capsys):
+    assert rt.main(["config", str(basic.feature), "--config", str(basic.config), "--agent", "gemini"]) in (0, 2)
+    assert "the gemini preset is experimental" in capsys.readouterr().out
+
+
 def _argv(tmp_path, monkeypatch, agent, model=""):
     monkeypatch.setattr(rt.shutil, "which", lambda name: f"/bin/{name}")
     repo = tmp_path / "r"
