@@ -158,6 +158,7 @@ run-tickets init   [--agent claude]         # write .ticket-runner.toml in the r
 `run` only:
 - `--keep-going`: with several features, go on to the next after a stop;
 - `--adopt-dirty`: after a crash, let the agent continue with its uncommitted edits;
+- `--no-input`: never ask on the terminal (what to do with such edits);
 - `--dry-run`: same as `status`.
 
 `retry`, `reset` and `skip` take a number (`5`, `05`) or a name (`05-slug`); `final` means
@@ -537,8 +538,11 @@ same command after Ctrl+C, `kill -9` or a power cut:
 - **review, verify or the final review was cut off:** the step reruns.
 - **The agent set `done` but the runner died before checking it:** the runner runs the checks
   first, tests included. The ticket is neither skipped unchecked nor done again.
-- **Uncommitted edits were left behind:** the runner refuses to start, since it cannot tell the
-  agent's edits from yours. If they are the agent's, run with `--adopt-dirty`.
+- **Uncommitted edits were left behind:** the runner cannot tell the agent's edits from yours,
+  so it does not just start. On a terminal it lists them and asks: **c** continues with them
+  (the agent finishes its own work), **s** sets them aside with `git stash` and redoes the
+  step from its last commit, **q** quits. Without a terminal (nohup, CI) or with `--no-input`
+  it stops instead; then run with `--adopt-dirty` to continue with the edits.
 
 **Locks.** One per feature (`runs/.lock`) and one per git working tree keep a second runner
 out. A lock left by a dead process is taken over.

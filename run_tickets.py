@@ -2480,7 +2480,17 @@ class Runner:
             pending = [n for n, e in self.state.data["tickets"].items()
                        if e.get("phase") in TICKET_PHASES + ("final",)
                        and (e.get("running") or e.get("last_stop"))]
-            if not (pending and self.opts.adopt_dirty):
+            choice = ""
+            if pending and self.opts.adopt_dirty:
+                choice = "c"
+            elif pending and self.can_ask():
+                choice = self.ask_dirty(pending[0], dirty)
+            if choice == "s" and not self.set_aside(pending[0]):
+                choice = "q"
+            if choice == "q":
+                say("nothing changed; run the same command again to choose again")
+                return EXIT_USAGE
+            if not choice:
                 warn(f"the working tree {self.git.repo} has uncommitted changes; commit or stash them first:")
                 warn(dirty)
                 if pending:
@@ -2503,6 +2513,49 @@ class Runner:
             if self.opts.once:
                 self.print_done()
                 return EXIT_OK
+
+    def can_ask(self) -> bool:
+        """Someone is at the terminal to answer (never in a piped, nohup or CI run)."""
+        return (UI.live and UI.tty and not getattr(self.opts, "no_input", False)
+                and sys.stdin is not None and sys.stdin.isatty())
+
+    def ask_dirty(self, name: str, dirty: str) -> str:
+        """What to do with the uncommitted edits a cut-off step left: c, s or q."""
+        phase = (self.state.data["tickets"].get(name) or {}).get("phase", "")
+        lines = [UI.style(f"{name} did not finish its {phase} step; these edits are not committed:",
+                          "yellow", "bold"),
+                 *dirty.splitlines(), "",
+                 f"{UI.style('c', 'bold')}  continue with them (as --adopt-dirty): the agent finishes its own work",
+                 f"{UI.style('s', 'bold')}  set them aside with git stash and redo the step from its last commit",
+                 f"{UI.style('q', 'bold')}  quit, leaving everything as it is"]
+        UI.write("\n" + "\n".join(UI.box(lines, "uncommitted edits", "yellow")))
+        while True:
+            try:
+                answer = input("c / s / q? ").strip().lower()[:1]
+            except (EOFError, KeyboardInterrupt):
+                UI.write("")
+                return "q"
+            if answer in ("c", "s", "q"):
+                return answer
+
+    def set_aside(self, name: str) -> bool:
+        """`git stash` of the working tree's tracked edits, outside the feature dir (the
+        ticket's own edits stay)."""
+        phase = (self.state.data["tickets"].get(name) or {}).get("phase", "")
+        message = f"run-tickets: {name} {phase} unfinished, set aside {now():%Y-%m-%d %H:%M}"
+        r = self.git.run("stash", "push", "-m", message, "--", ".",
+                         *([":(exclude)" + self.exclude] if self.exclude else []))
+        if r.returncode != 0:
+            warn(f"git stash failed: {(r.stderr or r.stdout).strip()}")
+            return False
+        ref = self.git.stash()[:10]
+        say(f"==> set aside as stash@{{0}} ({ref}); `git stash show -p stash@{{0}}` shows it, "
+            f"`git stash pop` brings it back")
+        self.event("dirty_set_aside", ticket=name, stash=ref)
+        append_durable(self.report, f"## {now():%Y-%m-%d %H:%M} {name} - uncommitted edits set aside\n\n"
+                                    f"The {phase} step did not finish; its uncommitted edits were stashed "
+                                    f"({ref}, \"{message}\") and the step starts again.\n\n")
+        return True
 
     def recover_finished_step(self) -> Optional[int]:
         """A step that was running when the runner died but whose ticket is already done
@@ -3403,6 +3456,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     r.add_argument("--dry-run", action="store_true", help="same as the status command")
     r.add_argument("--adopt-dirty", action="store_true",
                    help="after a crash mid-step, let the agent continue with the uncommitted changes")
+    r.add_argument("--no-input", dest="no_input", action="store_true",
+                   help="never ask on the terminal (what to do with a cut-off step's edits)")
 
     s = sub.add_parser("status", help="show tickets, the next one, what runs now and where it stopped")
     s.add_argument("feature")

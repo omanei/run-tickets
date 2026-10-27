@@ -6,6 +6,11 @@ All notable changes to this project are listed here. The format follows
 
 ## Unreleased
 
+### Added
+- After a step that did not finish and left uncommitted edits, the runner asks on a
+  terminal: continue with them, set them aside with `git stash` and redo the step, or quit
+  (#6). Without a terminal, or with the new `--no-input`, it stops as before.
+
 ### Fixed
 - In the live view, lines of the agent's output wider than the terminal are wrapped by the
   runner, so every screen line keeps the step's gutter and the rest of a list item lines

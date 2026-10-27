@@ -331,6 +331,79 @@ def test_adopt_dirty_after_stop(basic):
     assert "uncommitted changes in the working tree are its unfinished edits" in basic.calls_list()[1]["prompt"]
 
 
+class FakeTTY:
+    def isatty(self):
+        return True
+
+
+@pytest.fixture
+def terminal(monkeypatch):
+    """A person at the terminal: answers() sets what they type. Called in the test body:
+    pytest swaps sys.stdout for its capture after the fixtures are set up."""
+    asked = []
+
+    def answers(*typed):
+        monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+        monkeypatch.setattr(sys, "stdin", FakeTTY())
+        monkeypatch.setenv("TERM", "xterm")
+        queue = list(typed)
+
+        def fake_input(prompt=""):
+            asked.append(prompt)
+            if not queue:
+                raise EOFError
+            return queue.pop(0)
+        monkeypatch.setattr("builtins.input", fake_input)
+        return asked
+    return answers
+
+
+def stopped_dirty(basic):
+    basic.set_plan({"01-first:implement": ["dirty", "ok"]})
+    assert basic.run() == rt.EXIT_STOPPED
+    assert "half-done" in (basic.repo / "code.txt").read_text()
+
+
+def test_dirty_tree_asks_and_continues(basic, terminal, capsys):
+    stopped_dirty(basic)
+    asked = terminal("x", "c")  # a wrong key is asked again
+    assert basic.run("--once", "--ui", "live") == 0
+    assert len(asked) == 2
+    assert "M code.txt" in rt.ANSI_RE.sub("", capsys.readouterr().out)
+    assert "are its unfinished edits" in basic.calls_list()[1]["prompt"]
+
+
+def test_dirty_tree_set_aside_and_step_redone(basic, terminal, capsys):
+    stopped_dirty(basic)
+    terminal("s")
+    assert basic.run("--once", "--ui", "live") == 0
+    stashes = git(basic.repo, "stash", "list")
+    assert "run-tickets: 01-first implement unfinished, set aside" in stashes
+    assert "half-done" in git(basic.repo, "stash", "show", "-p", "stash@{0}")
+    assert "unfinished edits" not in basic.calls_list()[1]["prompt"]
+    assert basic.status("01-first") == "done"
+    assert "uncommitted edits set aside" in basic.report()
+    # The ticket file's own edits are never stashed.
+    assert "feat/" not in git(basic.repo, "stash", "show", "--name-only", "stash@{0}")
+
+
+def test_dirty_tree_quit_leaves_everything(basic, terminal):
+    stopped_dirty(basic)
+    terminal("q")
+    assert basic.run("--ui", "live") == rt.EXIT_USAGE
+    assert "half-done" in (basic.repo / "code.txt").read_text()
+    assert len(basic.calls_list()) == 1
+    assert git(basic.repo, "stash", "list") == ""
+
+
+def test_dirty_tree_never_asks_without_input(basic, terminal):
+    stopped_dirty(basic)
+    asked = terminal()
+    assert basic.run("--ui", "live", "--no-input") == rt.EXIT_USAGE
+    assert basic.run("--ui", "plain") == rt.EXIT_USAGE  # plain lines: no questions either
+    assert asked == []
+
+
 def test_dirty_tree_list_keeps_the_status_columns(basic, capsys):
     basic.set_plan({"01-first:implement": ["dirty"]})
     assert basic.run() == rt.EXIT_STOPPED
