@@ -989,6 +989,48 @@ def test_markdown_shows_a_diff_as_a_diff():
     assert plain_text(out[8:]) == ["• a bullet again"]
 
 
+RICH_SRC = ["```python", "def f(x):", "    return x  # done", "```",
+            "| name | size |", "|:--|--:|", "| a.py | 10 |", "after"]
+
+
+def feed_all(md, lines):
+    return [r for line in lines for r in md.feed(line)] + md.flush()
+
+
+def test_rich_highlights_code_and_frames_tables():
+    pytest.importorskip("rich")
+    ui = colored()
+    ui.rich = True
+    out = feed_all(rt.Markdown(ui), RICH_SRC)
+    text = [line.rstrip() for line in plain_text(out)]
+    assert text[:4] == ["┌─ python", "│ def f(x):", "│     return x  # done", "└─"]
+    assert len(rt.ANSI_RE.findall(out[1])) > 2  # colored by the syntax highlighter
+    table = "\n".join(text[4:-1])
+    assert "╭" in table and "╰" in table and "name" in table and "a.py" in table
+    assert re.search(r"│ a\.py\s+│\s+10 │", table)  # the second column is right-aligned
+    assert text[-1] == "after"
+
+
+def test_rich_unclosed_code_block_is_shown_at_the_end():
+    pytest.importorskip("rich")
+    ui = colored()
+    ui.rich = True
+    md = rt.Markdown(ui)
+    assert md.feed("```js") and md.feed("let x = 1") == []  # held until the block ends
+    assert [line.rstrip() for line in plain_text(md.flush())] == ["│ let x = 1"]
+    assert plain_text(md.feed("## after")) == ["after"]  # the fence is closed by the flush
+
+
+def test_without_rich_the_plain_renderer_is_used(monkeypatch):
+    monkeypatch.setitem(sys.modules, "rich", None)  # import rich -> ImportError
+    assert not rt.rich_available()
+    ui = colored()
+    ui.rich = True  # even when asked for: the render falls back to plain lines
+    text = plain_text(feed_all(rt.Markdown(ui), RICH_SRC))
+    assert text[:4] == ["┌─ python", "│ def f(x):", "│     return x  # done", "└─"]
+    assert text[4:7] == ["name │ size", "─────┼─────", "a.py │ 10  "]
+
+
 def test_path_arg_quotes_only_when_needed():
     ui = rt.Console()
     assert ui.path_arg(Path("/srv/feat")) == "/srv/feat"

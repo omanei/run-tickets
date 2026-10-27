@@ -56,7 +56,8 @@ def main() -> int:
         sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=cwd,
                              capture_output=True, text=True).stdout.strip()
         say(f"committed {sha}")
-        say(f"\n## Step report\n**Done:** {title.lower()}, in commit `{sha}`.\n\n"
+        say(f"\n## Step report\n**Done:** {title.lower()}, in commit `{sha}`:\n\n"
+            '```python\nwriter.writerow(["id", "total"])  # header first\n```\n\n'
             "| check | result |\n|---|---|\n| unit tests | 9 passed |\n| lint | clean |")
         return 0
 

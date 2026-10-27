@@ -41,8 +41,9 @@ the agent that doesn't trust any of that:
   process tree, and in the morning a summary says what was done, where it stopped and why.
 - **Local only.** The result is a branch in your repository; pushing it is up to you.
 
-It works on **Linux, macOS and Windows** with Python 3.9+ and git, and has no other
-dependencies. It drives **Claude Code, Codex, omp and pi** out of the box, and any other
+It works on **Linux, macOS and Windows** with Python 3.9+ and git. The installer brings the
+one library it uses, `rich`, for highlighted code and tables; a copied file runs without it.
+It drives **Claude Code, Codex, omp and pi** out of the box, and any other
 CLI agent through config. Each step can use its own agent and model.
 
 ## Quick start
@@ -120,8 +121,10 @@ python scripts/run_tickets.py run .scratch/my-feature     # Windows: py scripts\
 uv run scripts/run_tickets.py run .scratch/my-feature     # uv picks the Python for you
 ```
 
-The file declares its one dependency (`tomli`, for Python below 3.11) inline
-([PEP 723](https://peps.python.org/pep-0723/)), and `uv run` installs it.
+The file declares its dependencies inline ([PEP 723](https://peps.python.org/pep-0723/)),
+and `uv run` installs them: `rich` and, for Python below 3.11, `tomli`. With plain `python`
+nothing is needed: without `rich` code blocks are not highlighted and tables are drawn more
+simply, and without `tomli` (Python below 3.11 only) the config file cannot be read.
 
 ## Usage
 
@@ -176,7 +179,9 @@ Exit codes:
 On a terminal the runner shows a live view:
 - a header for each ticket and each step;
 - the agent's output with its markdown rendered: headings, lists, checkboxes, code blocks
-  and tables. Claude's tool calls get a line each;
+  with syntax highlighting, framed tables (both by [rich](https://github.com/Textualize/rich)
+  when it is installed, as it is with uv or pipx), and diffs in color. Claude's tool calls get
+  a line each;
 - a line at the end of each step saying whether it passed or failed, and why;
 - a status line at the bottom: the ticket, the step, the attempt, the time it has run, how
   long the agent has been silent, the cost, and progress across the feature (`✓01 ●02 ○03`);

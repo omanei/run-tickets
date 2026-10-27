@@ -16,6 +16,10 @@ All notable changes to this project are listed here. The format follows
 - `ui = "auto" | "live" | "plain"` in the config, `--ui` on the command line, and
   `RUN_TICKETS_UI` in the environment. Piped or redirected output stays plain lines, as
   before. `NO_COLOR` turns colors off.
+- `rich` as a dependency: uv and pipx install it, and the live view uses it to highlight
+  code blocks and frame tables. A copied `run_tickets.py` run with plain `python` works
+  without it, with its own simpler rendering.
+- Agents get `markdown = false` to have their output shown raw; codex has it.
 
 ## 0.3.0 - 2026-10-16
 

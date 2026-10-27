@@ -9,7 +9,7 @@ description = "Run a feature's tickets overnight with a coding agent (Claude Cod
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"
-dependencies = ['tomli>=1.1; python_version < "3.11"']
+dependencies = ['tomli>=1.1; python_version < "3.11"', 'rich>=13']
 keywords = ["ai-agents", "coding-agent", "claude-code", "codex", "automation", "tickets", "cli"]
 classifiers = [
     "Development Status :: 4 - Beta",

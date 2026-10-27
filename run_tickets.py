@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.9"
-# dependencies = ['tomli>=1.1; python_version < "3.11"']
+# dependencies = ['tomli>=1.1; python_version < "3.11"', 'rich>=13']
 # ///
 """run-tickets: implements a feature's tickets one after another with a coding agent.
 
-Works on Linux, macOS and Windows with Python 3.9+ and git; no third-party packages
-(a .ticket-runner.toml config needs Python 3.11+ or the `tomli` package).
+Works on Linux, macOS and Windows with Python 3.9+ and git. Installed with uv or pipx
+it brings `rich` (code highlighting and framed tables on the terminal); run as a plain
+file it works without any third-party package (a .ticket-runner.toml config then needs
+Python 3.11+ or the `tomli` package).
 
 A feature is a directory with issues/NN-<slug>.md tickets (the /to-tickets format of
 Matt Pocock's skills). Each ticket gets two fresh agent processes, so nothing carries
@@ -391,6 +393,16 @@ def enable_vt() -> bool:
         return False
 
 
+def rich_available() -> bool:
+    """The rich package: installers (uv, pipx) bring it; a copied run_tickets.py run with
+    plain `python` works without it, with simpler code blocks and tables."""
+    try:
+        import rich  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 class Console:
     SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
@@ -398,6 +410,8 @@ class Console:
         self.live = False  # the live view; False: plain lines
         self.color = False
         self.tty = False  # the status line is drawn only on a terminal
+        self.rich = False  # code blocks highlighted and tables framed by the rich package
+        self.hidden = False  # the cursor, while the status line is drawn
         self.lock = threading.RLock()
         self.status: Optional[Callable[[int], List[str]]] = None
         self.shown = 0  # status lines on the screen now
@@ -415,6 +429,16 @@ class Console:
             if self.live:
                 enable_vt()
         self.color = self.live and not os.environ.get("NO_COLOR")
+        self.rich = self.color and rich_available()
+
+    def rich_render(self, renderable: Any, width: int) -> List[str]:
+        """Lines of escape-coded text that rich draws for `renderable`."""
+        import io
+        from rich.console import Console as RichConsole
+        buf = io.StringIO()
+        RichConsole(file=buf, force_terminal=True, color_system="256", width=max(20, width),
+                    highlight=False, markup=False, emoji=False, legacy_windows=False).print(renderable)
+        return buf.getvalue().rstrip("\n").split("\n")
 
     def style(self, text: str, *names: str) -> str:
         if not self.color or not text or not names:
@@ -490,6 +514,8 @@ class Console:
         outer = self.status
         with self.lock:
             self.status = status
+            if outer is None:
+                self.hidden = True
             sys.stdout.write(self._clear() + ("" if outer else "\x1b[?25l") + self._draw())
             sys.stdout.flush()
         if outer is not None:  # the outer ticker keeps drawing, now this status
@@ -517,6 +543,7 @@ class Console:
             ticker.join(timeout=2)
             with self.lock:
                 self.status = None
+                self.hidden = False
                 sys.stdout.write(self._clear() + "\x1b[?25h")
                 sys.stdout.flush()
 
@@ -562,7 +589,7 @@ class Console:
 
 
 UI = Console()
-atexit.register(lambda: UI.live and sys.stdout.write("\x1b[?25h"))
+atexit.register(lambda: UI.hidden and sys.stdout.write("\x1b[?25h"))  # a cursor hidden by a crash
 
 
 def say(msg: str, live: Optional[str] = None) -> None:
@@ -603,13 +630,15 @@ class Markdown:
     def __init__(self, ui: Console):
         self.ui = ui
         self.fence = ""
+        self.lang = ""
+        self.code: List[str] = []  # a code block waiting for its end, to be highlighted (rich)
         self.table: List[str] = []
         self.diff = False  # inside a diff the agent printed: colored, not markdown
 
     def feed(self, line: str) -> List[str]:
         out: List[str] = []
         if self.table and (self.fence or not self.TABLE_RE.match(line)):
-            out += self.flush()
+            out += self.flush_table()
         st = self.ui.style
         if not self.fence:
             self.diff = bool(self.DIFF_START_RE.match(line) or (self.diff and self.DIFF_LINE_RE.match(line)))
@@ -620,19 +649,42 @@ class Markdown:
         if self.fence:
             if re.match(rf"^\s*{re.escape(self.fence[0])}{{{len(self.fence)},}}\s*$", line):
                 self.fence = ""
-                return out + [st("└─", "gray")]
+                return out + self.flush_code() + [st("└─", "gray")]
+            if self.ui.rich:
+                self.code.append(line)
+                return out
             return out + [st("│ ", "gray") + line]
         m = self.FENCE_RE.match(line)
         if m:
             self.fence = m.group(2)
-            lang = m.group(3).lstrip("`~")
-            return out + [st("┌─" + (f" {lang}" if lang else ""), "gray")]
+            self.lang = m.group(3).lstrip("`~")
+            return out + [st("┌─" + (f" {self.lang}" if self.lang else ""), "gray")]
         if self.TABLE_RE.match(line):
             self.table.append(line)
             return out
         return out + [self.block(line)]
 
     def flush(self) -> List[str]:
+        """What is still held back when a piece of output ends (the agent's output, or one
+        of Claude's messages): a table, an unclosed code block."""
+        out = self.flush_table() + self.flush_code()
+        self.fence = ""
+        return out
+
+    def flush_code(self) -> List[str]:
+        code, self.code = self.code, []
+        if not code:
+            return []
+        try:
+            from rich.syntax import Syntax
+            lines = self.ui.rich_render(Syntax("\n".join(code), self.lang or "text", theme="ansi_dark",
+                                               background_color="default", word_wrap=True),
+                                        self.ui.width() - 8)
+        except Exception:  # noqa: BLE001 - rich is a nicety; the plain lines always work
+            lines = code
+        return [self.ui.style("│ ", "gray") + line for line in lines]
+
+    def flush_table(self) -> List[str]:
         rows, self.table = self.table, []
         if not rows:
             return []
@@ -642,8 +694,13 @@ class Markdown:
                  for i, r in enumerate(rows) if i != 1]
         ncols = max(len(r) for r in cells)
         cells = [r + [""] * (ncols - len(r)) for r in cells]
-        widths = [max(visible_len(r[i]) for r in cells) for i in range(ncols)]
         indent = re.match(r"^\s*", rows[0]).group(0)  # type: ignore[union-attr]
+        if self.ui.rich:
+            try:
+                return [indent + line for line in self.rich_table(cells, rows[1])]
+            except Exception:  # noqa: BLE001
+                pass
+        widths = [max(visible_len(r[i]) for r in cells) for i in range(ncols)]
         sep = self.ui.style(" │ ", "gray")
 
         def row(r: List[str], bold: bool = False) -> str:
@@ -652,6 +709,24 @@ class Markdown:
 
         line = self.ui.style("─┼─".join("─" * w for w in widths), "gray")
         return [row(cells[0], True), indent + line] + [row(r) for r in cells[1:]]
+
+    def rich_table(self, cells: List[List[str]], separator: str) -> List[str]:
+        """The table drawn by rich: a frame, cells wrapped to the terminal's width."""
+        from rich import box
+        from rich.table import Table
+        from rich.text import Text
+        aligns = []
+        for spec in separator.strip().strip("|").split("|"):
+            spec = spec.strip()
+            aligns.append("center" if spec.startswith(":") and spec.endswith(":") else
+                          "right" if spec.endswith(":") else "left")
+        table = Table(box=box.ROUNDED, border_style="bright_black", header_style="bold",
+                      show_header=True, pad_edge=True)
+        for i, head in enumerate(cells[0]):
+            table.add_column(Text.from_ansi(head), justify=aligns[i] if i < len(aligns) else "left")  # type: ignore[arg-type]
+        for row in cells[1:]:
+            table.add_row(*(Text.from_ansi(c) for c in row))
+        return self.ui.rich_render(table, self.ui.width() - 8)
 
     @staticmethod
     def is_separator(line: str) -> bool:
