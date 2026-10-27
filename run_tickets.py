@@ -377,6 +377,59 @@ def clip(text: str, width: int) -> str:
     return "".join(out) + "…" + ("\x1b[0m" if "\x1b" in text else "")
 
 
+HANGING_RE = re.compile(r"^(\s*(?:[•◦▪✓○▎]|\d+[.)]|│)?\s*)")  # what a wrapped line's rest aligns under
+
+
+def wrap(text: str, width: int) -> List[str]:
+    """`text` broken into lines of at most `width` columns, at a space where there is
+    one. The rest of a list item lines up under its text, not under the bullet. Escape
+    codes are kept, and the styles open at a break are reopened on the next line."""
+    if visible_len(text) <= width:
+        return [text]
+    indent = min(visible_len(HANGING_RE.match(ANSI_RE.sub("", text)).group(1)),  # type: ignore[union-attr]
+                 width // 2)
+    tokens: List[Tuple[str, int]] = []
+    i = 0
+    while i < len(text):
+        m = ANSI_RE.match(text, i)
+        if m:
+            tokens.append((m.group(0), 0))
+            i = m.end()
+        else:
+            tokens.append((text[i], char_width(text[i])))
+            i += 1
+    lines: List[str] = []
+    styles = ""  # escape codes in effect where the current line starts
+    cur: List[Tuple[str, int]] = []
+    used = 0
+
+    def emit(part: List[Tuple[str, int]], last: bool) -> None:
+        nonlocal styles
+        body = "".join(t for t, _ in part)
+        lead = " " * indent if lines else ""
+        lines.append(lead + styles + body + ("" if last or not (styles or "\x1b" in body) else "\x1b[0m"))
+        for t, _ in part:
+            if SGR_RE.fullmatch(t):
+                styles = "" if t in ("\x1b[0m", "\x1b[m") else styles + t
+
+    for tok, w in tokens:
+        room = width - (indent if lines else 0)
+        if tok == " " and used + 1 > room and used:  # the line is full right before a space
+            emit(cur, False)
+            cur, used = [], 0
+            continue
+        if w and used + w > room and used:
+            spaces = [k for k, (t, _) in enumerate(cur) if t == " " and k > 0]
+            cut = spaces[-1] if spaces and sum(x for _, x in cur[:spaces[-1]]) > room // 3 else None
+            head, tail = (cur[:cut], cur[cut + 1:]) if cut is not None else (cur, [])
+            emit(head, False)
+            cur, used = tail, sum(x for _, x in tail)
+        cur.append((tok, w))
+        used += w
+    emit(cur, True)
+    return lines
+
+
 def enable_vt() -> bool:
     """Escape codes work in the console (Windows 10+ needs them switched on)."""
     if not IS_WINDOWS:
@@ -771,23 +824,26 @@ class Markdown:
 
     def inline(self, text: str) -> str:
         st = self.ui.style
+        # Code spans first, as placeholders: nothing inside them is markdown, and emphasis
+        # around them (**the commit `abc123`**) still pairs up.
+        codes: List[str] = []
+
+        def hold(m: "re.Match[str]") -> str:
+            codes.append(m.group(2))
+            return f"{len(codes) - 1}"
+
+        text = re.sub(r"(`+)(.+?)\1", hold, text)
         out = []
-        for i, part in enumerate(re.split(r"(`+)(.+?)\1", text)):
-            kind = i % 3  # re.split with two groups: text, the backticks, the code
-            if kind == 1:
-                continue
-            if kind == 2:
-                out.append(st(part, "cyan"))
-                continue
-            # Links: text, label, url, text, ...; the url is printed as it is.
-            pieces = re.split(r"\[([^\]\n]+)\]\(([^)\s]+)\)", part)
-            for j in range(0, len(pieces), 3):
-                out.append(self.emphasis(pieces[j]))
-                if j + 2 < len(pieces):
-                    label, url = pieces[j + 1], pieces[j + 2]
-                    out.append(st(self.emphasis(label), "underline")
-                               + (st(f" ({url})", "gray") if url != label else ""))
-        return "".join(out)
+        # Links: text, label, url, text, ...; the url is printed as it is.
+        pieces = re.split(r"\[([^\]\n]+)\]\(([^)\s]+)\)", text)
+        for j in range(0, len(pieces), 3):
+            out.append(self.emphasis(pieces[j]))
+            if j + 2 < len(pieces):
+                label, url = pieces[j + 1], pieces[j + 2]
+                out.append(st(self.emphasis(label), "underline")
+                           + (st(f" ({url})", "gray") if url != label else ""))
+        return re.sub("(\\d+)", lambda m: st(codes[int(m.group(1))], "cyan")
+                      if int(m.group(1)) < len(codes) else m.group(0), "".join(out))
 
     def emphasis(self, text: str) -> str:
         for pattern, style in self.EMPHASIS:
@@ -2077,7 +2133,7 @@ class Runner:
                     if UI.live:
                         try:
                             for rendered in md.flush():
-                                UI.write(self.gutter(step) + rendered)
+                                self.agent_line(step, rendered)
                         except Exception:  # noqa: BLE001
                             pass
 
@@ -2133,6 +2189,13 @@ class Runner:
     def gutter(step: str) -> str:
         return "  " + UI.style("│", STEP_COLORS.get(step, "gray")) + " "
 
+    def agent_line(self, step: str, text: str) -> None:
+        """A line of the agent's output behind the step's gutter, wrapped here rather than
+        by the terminal, so that every screen line keeps the gutter."""
+        gutter = self.gutter(step)
+        for line in wrap(text, UI.width() - 1 - visible_len(gutter)):
+            UI.write(gutter + line)
+
     def show_output(self, md: Markdown, line: str, stream: bool, step: str, markdown: bool) -> None:
         """One line of the agent's output in the live view: markdown rendered (unless the
         agent prints raw tool output: markdown = false), tool calls on a line of their own."""
@@ -2141,24 +2204,24 @@ class Runner:
         for kind, a, b in items:
             if kind != "text":
                 for rendered in md.flush():
-                    UI.write(self.gutter(step) + rendered)
+                    self.agent_line(step, rendered)
             if kind == "tool":
-                UI.write(self.gutter(step) + UI.style("▸ ", "cyan") + UI.style(a, "bold")
+                self.agent_line(step, UI.style("▸ ", "cyan") + UI.style(a, "bold")
                          + (" " + UI.style(b, "gray") if b else ""))
             elif kind == "result":
-                UI.write(self.gutter(step) + UI.style(f"▸ result: {a}", "gray"))
+                self.agent_line(step, UI.style(f"▸ result: {a}", "gray"))
             else:
                 for sub in a.split("\n"):
                     if "\x1b" in sub and UI.color:  # the agent colors its output: keep the colors only
                         kept = ANSI_RE.sub(lambda m: m.group(0) if SGR_RE.fullmatch(m.group(0)) else "", sub)
-                        UI.write(self.gutter(step) + kept + "\x1b[0m")
+                        self.agent_line(step, kept + "\x1b[0m")
                         continue
                     sub = ANSI_RE.sub("", sub)
                     if not markdown:
-                        UI.write(self.gutter(step) + sub)
+                        self.agent_line(step, sub)
                         continue
                     for rendered in md.feed(sub):
-                        UI.write(self.gutter(step) + rendered)
+                        self.agent_line(step, rendered)
 
     def show_step_result(self, unit: Any, step: str, run: StepRun) -> None:
         bits = [fmt_duration(run.seconds)]

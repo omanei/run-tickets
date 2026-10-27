@@ -998,6 +998,46 @@ def test_markdown_emphasis_and_links():
     assert "\x1b[1mbold\x1b[22m" in out[0] and "\x1b[3mit\x1b[23m" in out[0]
 
 
+def test_markdown_emphasis_around_code():
+    out = rt.Markdown(colored()).feed("**the commit `a2dd24a`** (on top of `10725`)")
+    assert plain_text(out) == ["the commit a2dd24a (on top of 10725)"]
+    assert out[0].startswith("\x1b[1mthe commit \x1b[36ma2dd24a\x1b[39m\x1b[22m")
+
+
+def test_wrap_keeps_lines_in_width_at_spaces():
+    text = "one two three four five six seven eight nine ten"
+    assert rt.wrap(text, 20) == ["one two three four", "five six seven eight", "nine ten"]
+    assert rt.wrap("x" * 25, 10) == ["x" * 10, "x" * 10, "x" * 5]  # no space: a hard break
+    assert rt.wrap("short", 20) == ["short"]
+
+
+def test_wrap_hangs_list_items_and_reopens_styles():
+    ui = colored()
+    item = rt.Markdown(ui).feed("- `superset/models/access_request.py` is the model and the migration")[0]
+    lines = rt.wrap(item, 30)
+    text = plain_text(lines)
+    assert all(rt.visible_len(line) <= 30 for line in lines)
+    assert text[0].startswith("• ") and all(t.startswith("  ") for t in text[1:])
+    assert lines[1].startswith("  \x1b[36m")  # the cut code span goes on in its color
+
+
+def test_wrap_carries_an_open_style_across_the_break():
+    ui = colored()
+    lines = rt.wrap(ui.style("a" * 12, "cyan") + " tail", 10)
+    assert lines[0] == "\x1b[36m" + "a" * 10 + "\x1b[0m"
+    assert lines[1] == "\x1b[36m" + "aa\x1b[39m tail"
+
+
+def test_live_view_wraps_long_agent_lines_behind_the_gutter(basic, capsys, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "40")
+    monkeypatch.setenv("STUB_LONG_LINE", "1")
+    assert basic.run("--once", "--ui", "live") == 0
+    lines = rt.ANSI_RE.sub("", capsys.readouterr().out).splitlines()
+    long = [i for i, l in enumerate(lines) if "│ a long line" in l][0]
+    assert all(len(l) <= 39 for l in lines[long:long + 3])
+    assert lines[long + 1].startswith("  │ ") and "words" in lines[long + 1]
+
+
 def test_markdown_one_line_fence_is_not_a_block():
     md = rt.Markdown(colored())
     assert plain_text(md.feed("```bash ls```")) == ["bash ls"]

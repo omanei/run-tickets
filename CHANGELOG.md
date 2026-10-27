@@ -4,6 +4,17 @@ All notable changes to this project are listed here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Fixed
+- In the live view, lines of the agent's output wider than the terminal are wrapped by the
+  runner, so every screen line keeps the step's gutter and the rest of a list item lines
+  up under its text. Styles open at a break go on in the next line.
+- Emphasis around inline code (`**the commit `abc123`**`) is rendered.
+- The list of uncommitted files kept losing the leading space of its first line, and
+  the check of `protected` paths read the first uncommitted file's name without its
+  first letter (#9).
+
 ## 0.4.0 - 2026-10-27
 
 ### Added

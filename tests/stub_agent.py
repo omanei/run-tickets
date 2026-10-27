@@ -122,6 +122,8 @@ def main():
             text = text.replace("**Status:** ready-for-agent", "**Status:** done")
         ticket.write_text(text, encoding="utf-8")
     final = f"Done.\n\n## Step report\n- step: {step} {name} ({action})"
+    if os.environ.get("STUB_LONG_LINE"):  # wider than the terminal
+        print("a long line " + "of many words " * 6)
     if os.environ.get("STUB_ANSI"):  # an agent that colors its own output
         print("\x1b[31mFAILED\x1b[0m one test\x1b[2K, fixed it")
     if os.environ.get("STUB_STREAM"):  # Claude Code's --output-format stream-json
