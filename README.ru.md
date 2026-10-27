@@ -3,6 +3,7 @@
 [![tests](https://github.com/omanei/run-tickets/actions/workflows/test.yml/badge.svg)](https://github.com/omanei/run-tickets/actions/workflows/test.yml)
 ![python](https://img.shields.io/badge/python-3.9%2B-blue)
 ![platforms](https://img.shields.io/badge/os-linux%20%7C%20macos%20%7C%20windows-lightgrey)
+[![pypi](https://img.shields.io/pypi/v/run-tickets?label=pypi)](https://pypi.org/project/run-tickets/)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [English](README.md) | **Русский**
